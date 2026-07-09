@@ -1,0 +1,78 @@
+name: Nimble extension
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  linux-x86:
+    name: ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CMAKE_PREFIX_PATH: ${{ vars.ROCKSDB_EXTENSIONS_DEPENDENCY_PREFIX }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            ccache \
+            cmake \
+            flex \
+            git \
+            libaio-dev \
+            libboost-all-dev \
+            libbz2-dev \
+            libdouble-conversion-dev \
+            libevent-dev \
+            libfmt-dev \
+            libgflags-dev \
+            libgoogle-glog-dev \
+            liblz4-dev \
+            liblzma-dev \
+            libre2-dev \
+            libsnappy-dev \
+            libssl-dev \
+            libunwind-dev \
+            liburing-dev \
+            libzstd-dev \
+            ninja-build \
+            pkg-config \
+            zlib1g-dev
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          if [ -z "$CMAKE_PREFIX_PATH" ]; then
+            echo "ROCKSDB_EXTENSIONS_DEPENDENCY_PREFIX must point at installed dependency packages for CI." >&2
+            exit 1
+          fi
+          cmake -S . -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DROCKSDB_EXTENSIONS_BUILD_TESTS=ON \
+            -DROCKSDB_EXTENSIONS_FETCH_DEPS=OFF \
+            -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"
+
+      - name: Build
+        run: cmake --build build --target rocksdb_extensions_nimble_test
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

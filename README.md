@@ -36,6 +36,11 @@ cd rocksdb-extensions
 Each extension is self-contained in its own directory with its own build and
 usage documentation.
 
+Current extensions:
+
+- [Nimble](nimble/README.md): RocksDB `ExternalTable` integration for scanning
+  Nimble columnar files with projection pushdown.
+
 ## Contributing
 
 We welcome contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) to learn
