@@ -1,0 +1,47 @@
+name: rocksdb_extension
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  linux-x86:
+    name: ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 120
+    env:
+      ROCKSDB_REVISION: v11.8.0
+      NIMBLE_REVISION: acead744054eb006da753390ba80d3b6a29212ce
+      CLEAN_BUILD_DIRECTORY: ON
+      GH_TOKEN: ${{ github.token }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: ./scripts/build-latest-releases.sh

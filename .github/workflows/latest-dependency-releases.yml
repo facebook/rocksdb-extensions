@@ -1,0 +1,50 @@
+name: Latest dependency releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      rocksdb_revision:
+        description: Optional RocksDB tag, branch, or commit override
+        required: false
+        type: string
+      nimble_revision:
+        description: Optional Nimble tag, branch, or commit override
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build-latest:
+    name: ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      GH_TOKEN: ${{ github.token }}
+      ROCKSDB_REVISION: ${{ inputs.rocksdb_revision }}
+      NIMBLE_REVISION: ${{ inputs.nimble_revision }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test latest releases
+        run: ./scripts/build-latest-releases.sh

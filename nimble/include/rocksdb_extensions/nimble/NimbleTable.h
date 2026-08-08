@@ -13,7 +13,7 @@
 #include <folly/io/IOBuf.h>
 
 #include "dwio/nimble/common/Exceptions.h"
-#include "dwio/nimble/serializer/DeserializerImpl.h"
+#include "dwio/nimble/serializer/SerializationHeader.h"
 #include "dwio/nimble/velox/RowRange.h"
 #include "rocksdb/external_table.h"
 #include "velox/common/memory/Memory.h"

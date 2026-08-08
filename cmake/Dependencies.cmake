@@ -19,6 +19,8 @@ set(ROCKSDB_EXTENSIONS_VELOX_SOURCE_DIR "" CACHE PATH "Optional local Velox sour
 set(ROCKSDB_EXTENSIONS_NIMBLE_GIT_REPOSITORY "https://github.com/facebookincubator/nimble.git" CACHE STRING "Nimble repository")
 set(ROCKSDB_EXTENSIONS_NIMBLE_GIT_TAG "main" CACHE STRING "Nimble revision")
 set(ROCKSDB_EXTENSIONS_NIMBLE_SOURCE_DIR "" CACHE PATH "Optional local Nimble source directory")
+set(ROCKSDB_EXTENSIONS_FLATBUFFERS_GIT_REPOSITORY "https://github.com/google/flatbuffers.git" CACHE STRING "FlatBuffers repository")
+set(ROCKSDB_EXTENSIONS_FLATBUFFERS_GIT_TAG "v25.2.10" CACHE STRING "FlatBuffers revision")
 
 function(rocksdb_extensions_fetch_dependency name repository tag)
   if(NOT ROCKSDB_EXTENSIONS_FETCH_DEPS)
@@ -103,25 +105,6 @@ function(rocksdb_extensions_require_targets group_name)
   endif()
 endfunction()
 
-find_package(fmt CONFIG QUIET)
-if(NOT TARGET fmt::fmt)
-  find_package(fmt QUIET)
-endif()
-
-find_package(Folly CONFIG QUIET)
-if(NOT TARGET Folly::folly AND NOT TARGET folly)
-  rocksdb_extensions_add_source_dependency(
-    ROCKSDB_EXTENSIONS_FOLLY_SOURCE_ADDED
-    folly
-    "${ROCKSDB_EXTENSIONS_FOLLY_SOURCE_DIR}")
-endif()
-if(NOT TARGET Folly::folly AND NOT TARGET folly AND NOT ROCKSDB_EXTENSIONS_FOLLY_SOURCE_ADDED)
-  rocksdb_extensions_fetch_dependency(
-    folly
-    ${ROCKSDB_EXTENSIONS_FOLLY_GIT_REPOSITORY}
-    ${ROCKSDB_EXTENSIONS_FOLLY_GIT_TAG})
-endif()
-
 find_package(RocksDB CONFIG QUIET)
 if(NOT TARGET RocksDB::rocksdb AND NOT TARGET rocksdb AND NOT TARGET rocksdb_static)
   rocksdb_extensions_add_source_dependency(
@@ -140,22 +123,40 @@ if(NOT TARGET RocksDB::rocksdb AND NOT TARGET rocksdb AND NOT TARGET rocksdb_sta
     ${ROCKSDB_EXTENSIONS_ROCKSDB_GIT_TAG})
 endif()
 
-find_package(velox CONFIG QUIET)
-if(NOT TARGET velox_dwio_common)
-  set(VELOX_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-  set(VELOX_BUILD_TEST_UTILS OFF CACHE BOOL "" FORCE)
-  set(VELOX_ENABLE_BENCHMARKS OFF CACHE BOOL "" FORCE)
-  rocksdb_extensions_add_source_dependency(
-    ROCKSDB_EXTENSIONS_VELOX_SOURCE_ADDED
-    velox
-    "${ROCKSDB_EXTENSIONS_VELOX_SOURCE_DIR}")
+# Nimble requires both the FlatBuffers headers and flatc. Some system packages
+# export incompatible package-name capitalization or omit the compiler. The
+# find-package override makes Nimble's find_package(flatbuffers) resolve this
+# pinned source build consistently.
+if(ROCKSDB_EXTENSIONS_FETCH_DEPS)
+  set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(FLATBUFFERS_INSTALL OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    flatbuffers
+    GIT_REPOSITORY ${ROCKSDB_EXTENSIONS_FLATBUFFERS_GIT_REPOSITORY}
+    GIT_TAG ${ROCKSDB_EXTENSIONS_FLATBUFFERS_GIT_TAG}
+    GIT_SHALLOW TRUE
+    OVERRIDE_FIND_PACKAGE)
+  FetchContent_MakeAvailable(flatbuffers)
 endif()
-if(NOT TARGET velox_dwio_common AND NOT ROCKSDB_EXTENSIONS_VELOX_SOURCE_ADDED)
-  rocksdb_extensions_fetch_dependency(
-    velox
-    ${ROCKSDB_EXTENSIONS_VELOX_GIT_REPOSITORY}
-    ${ROCKSDB_EXTENSIONS_VELOX_GIT_TAG})
+
+if(NOT TARGET fmt::fmt)
+  find_package(fmt CONFIG QUIET)
 endif()
+if(NOT TARGET fmt::fmt)
+  find_package(fmt QUIET)
+endif()
+
+# These options must be in the cache before Nimble adds its pinned Velox
+# submodule. They also apply if Velox has to be resolved separately below.
+set(Boost_SOURCE BUNDLED CACHE STRING "" FORCE)
+set(FastFloat_SOURCE BUNDLED CACHE STRING "" FORCE)
+set(VELOX_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(VELOX_BUILD_TEST_UTILS OFF CACHE BOOL "" FORCE)
+set(VELOX_BUILD_MINIMAL_WITH_DWIO ON CACHE BOOL "" FORCE)
+set(VELOX_BUILD_RUNNER OFF CACHE BOOL "" FORCE)
+set(VELOX_ENABLE_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(VELOX_ENABLE_GEO OFF CACHE BOOL "" FORCE)
+set(VELOX_ENABLE_PARQUET OFF CACHE BOOL "" FORCE)
 
 find_package(nimble CONFIG QUIET)
 if(NOT TARGET nimble_index_projector AND NOT TARGET nimble::nimble)
@@ -171,6 +172,49 @@ if(NOT TARGET nimble_index_projector AND NOT TARGET nimble::nimble AND NOT ROCKS
     nimble
     ${ROCKSDB_EXTENSIONS_NIMBLE_GIT_REPOSITORY}
     ${ROCKSDB_EXTENSIONS_NIMBLE_GIT_TAG})
+endif()
+
+# A source build of Nimble adds the Velox submodule revision that Nimble pins.
+# Resolve Velox only after Nimble so CMake does not add an independent Velox
+# checkout first and then fail when Nimble creates the same targets again.
+find_package(velox CONFIG QUIET)
+if(NOT TARGET velox_dwio_common)
+  rocksdb_extensions_add_source_dependency(
+    ROCKSDB_EXTENSIONS_VELOX_SOURCE_ADDED
+    velox
+    "${ROCKSDB_EXTENSIONS_VELOX_SOURCE_DIR}")
+endif()
+if(NOT TARGET velox_dwio_common AND NOT ROCKSDB_EXTENSIONS_VELOX_SOURCE_ADDED)
+  rocksdb_extensions_fetch_dependency(
+    velox
+    ${ROCKSDB_EXTENSIONS_VELOX_GIT_REPOSITORY}
+    ${ROCKSDB_EXTENSIONS_VELOX_GIT_TAG})
+endif()
+
+# Resolve these after Nimble and Velox so a source build uses their compatible
+# pinned revisions. Adding independent source trees first creates duplicate
+# Folly::folly and fmt::fmt targets and can mix incompatible versions.
+if(NOT TARGET fmt::fmt)
+  find_package(fmt CONFIG QUIET)
+endif()
+if(NOT TARGET fmt::fmt)
+  find_package(fmt QUIET)
+endif()
+
+if(NOT TARGET Folly::folly AND NOT TARGET folly)
+  find_package(Folly CONFIG QUIET)
+endif()
+if(NOT TARGET Folly::folly AND NOT TARGET folly)
+  rocksdb_extensions_add_source_dependency(
+    ROCKSDB_EXTENSIONS_FOLLY_SOURCE_ADDED
+    folly
+    "${ROCKSDB_EXTENSIONS_FOLLY_SOURCE_DIR}")
+endif()
+if(NOT TARGET Folly::folly AND NOT TARGET folly AND NOT ROCKSDB_EXTENSIONS_FOLLY_SOURCE_ADDED)
+  rocksdb_extensions_fetch_dependency(
+    folly
+    ${ROCKSDB_EXTENSIONS_FOLLY_GIT_REPOSITORY}
+    ${ROCKSDB_EXTENSIONS_FOLLY_GIT_TAG})
 endif()
 
 rocksdb_extensions_resolve_target(
@@ -217,8 +261,8 @@ set(ROCKSDB_EXTENSIONS_VELOX_TARGETS
 
 set(ROCKSDB_EXTENSIONS_NIMBLE_TARGETS
   nimble_common
-  nimble_deserializer_impl
-  nimble_serializer_impl
+  nimble_deserializer
+  nimble_serializer
   nimble_tablet_reader
   nimble_tablet_reader_cache
   nimble_velox_common
