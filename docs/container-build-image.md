@@ -103,6 +103,7 @@ podman login ghcr.io -u <github-user>
 ./scripts/build-container-image.sh 24 --push
 ```
 
-Keep the `rocksdb-extensions_ubuntu` package public. The workflows use
-`ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0` as their job container and
-pull it without credentials.
+Keep the `rocksdb-extensions_ubuntu` package public. The workflows grant
+`packages: read` because GitHub automatically authenticates GHCR job-container
+pulls with `GITHUB_TOKEN`, even without an explicit `container.credentials`
+block.
