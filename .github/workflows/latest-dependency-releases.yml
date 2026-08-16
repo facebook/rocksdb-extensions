@@ -19,12 +19,14 @@ permissions:
 jobs:
   build-latest:
     name: ${{ matrix.compiler }}
-    runs-on: ubuntu-24.04
+    runs-on:
+      labels: 32-core-ubuntu
     container:
       image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      options: --shm-size=16gb
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -37,8 +39,15 @@ jobs:
             cc: clang
             cxx: clang++
     env:
+      # Older devvm-built images contain a loopback proxy that is unreachable
+      # from GitHub-hosted job containers.
+      http_proxy: ""
+      https_proxy: ""
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
+      BUILD_JOBS: 64
+      CLEAN_BUILD_DIRECTORY: OFF
+      FETCHCONTENT_UPDATES_DISCONNECTED: ON
       GH_TOKEN: ${{ github.token }}
       ROCKSDB_REVISION: ${{ inputs.rocksdb_revision }}
       NIMBLE_REVISION: ${{ inputs.nimble_revision }}
@@ -46,5 +55,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve dependency revisions
+        id: revisions
+        run: ./scripts/build-latest-releases.sh --resolve-only >> "${GITHUB_OUTPUT}"
+
+      - name: Restore dependency caches
+        uses: ./.github/actions/setup-dependency-cache
+        with:
+          compiler: ${{ matrix.compiler }}
+          cxx: ${{ matrix.cxx }}
+          rocksdb-revision: ${{ steps.revisions.outputs.rocksdb_revision }}
+          nimble-revision: ${{ steps.revisions.outputs.nimble_revision }}
+
       - name: Build and test latest releases
+        env:
+          ROCKSDB_REVISION: ${{ steps.revisions.outputs.rocksdb_revision }}
+          NIMBLE_REVISION: ${{ steps.revisions.outputs.nimble_revision }}
         run: ./scripts/build-latest-releases.sh
+
+      - name: Report compiler cache statistics
+        if: always()
+        run: ccache --show-stats || true

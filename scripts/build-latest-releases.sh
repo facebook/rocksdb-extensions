@@ -12,6 +12,19 @@ readonly SCRIPT_DIR
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 readonly REPOSITORY_ROOT
 
+resolve_only=0
+case "${1:-}" in
+  "")
+    ;;
+  --resolve-only)
+    resolve_only=1
+    ;;
+  *)
+    echo "Usage: $0 [--resolve-only]" >&2
+    exit 1
+    ;;
+esac
+
 resolve_latest_revision() {
   local repository="$1"
   local default_branch
@@ -71,6 +84,12 @@ if [[ -z "${nimble_revision}" ]]; then
   nimble_revision="$(resolve_latest_revision facebookincubator/nimble)"
 fi
 
+if [[ "${resolve_only}" != "0" ]]; then
+  printf 'rocksdb_revision=%s\n' "${rocksdb_revision}"
+  printf 'nimble_revision=%s\n' "${nimble_revision}"
+  exit 0
+fi
+
 build_directory="${BUILD_DIRECTORY:-${REPOSITORY_ROOT}/build-latest-releases}"
 build_type="${CMAKE_BUILD_TYPE:-RelWithDebInfo}"
 clean_build_directory="${CLEAN_BUILD_DIRECTORY:-ON}"
@@ -100,6 +119,16 @@ fi
 build_jobs="${BUILD_JOBS:-}"
 if [[ -z "${build_jobs}" ]]; then
   build_jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2\n')"
+fi
+
+cmake_compiler_launcher_args=()
+compiler_launcher="none"
+if command -v ccache >/dev/null 2>&1; then
+  compiler_launcher="$(command -v ccache)"
+  cmake_compiler_launcher_args=(
+    -DCMAKE_C_COMPILER_LAUNCHER:FILEPATH="${compiler_launcher}"
+    -DCMAKE_CXX_COMPILER_LAUNCHER:FILEPATH="${compiler_launcher}"
+  )
 fi
 
 cmake_standard_flag_args=()
@@ -266,6 +295,8 @@ patch_flatbuffers_include_build_flags() {
 echo "Testing RocksDB revision: ${rocksdb_revision}"
 echo "Testing Nimble revision:  ${nimble_revision}"
 echo "Build directory:          ${build_directory}"
+echo "Build jobs:               ${build_jobs}"
+echo "Compiler launcher:        ${compiler_launcher}"
 echo "C++ extensions:           ${cxx_extensions}"
 echo "Force GNU C++20:          ${force_gnu_cxx20}"
 echo "Disable Folly liburing:   ${force_disable_folly_liburing}"
@@ -292,6 +323,7 @@ cmake \
   -S "${REPOSITORY_ROOT}" \
   -B "${build_directory}" \
   "${cmake_generator_args[@]}" \
+  "${cmake_compiler_launcher_args[@]}" \
   "${cmake_standard_flag_args[@]}" \
   -DCMAKE_BUILD_TYPE="${build_type}" \
   -DCMAKE_CXX_FLAGS:STRING="${cmake_cxx_flags}" \
@@ -319,3 +351,7 @@ ctest \
   --test-dir "${build_directory}" \
   -R '^rocksdb_extensions_nimble_test$' \
   --output-on-failure
+
+if [[ "${compiler_launcher}" != "none" ]]; then
+  ccache --show-stats || true
+fi

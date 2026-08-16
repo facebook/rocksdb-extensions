@@ -56,6 +56,19 @@ but pins the validated dependency revisions so ordinary PR CI is reproducible:
 The workflow builds `rocksdb_extensions_nimble_test` and runs the filtered CTest
 entry for that binary.
 
+Both compiler jobs use the same `32-core-ubuntu` runner class as RocksDB's
+Folly CI jobs and build with up to 64 parallel compile processes. CI caches the
+FetchContent source trees and a compressed ccache directory. Cache identities
+include the resolved RocksDB and Nimble commits, compiler identity, container
+image, architecture, and dependency build configuration. An upstream revision
+or relevant build configuration change therefore creates a new cache instead
+of reusing incompatible objects.
+
+The raw FetchContent build tree is intentionally not cached because a local
+RelWithDebInfo build is roughly 18 GB. Restoring source trees plus compiler
+objects provides reuse across RocksDB, Nimble, Velox, Folly, FlatBuffers, and
+their transitive dependencies without transferring the full CMake build tree.
+
 `scripts/build-latest-releases.sh` disables Folly's liburing integration by
 default for this release-validation path. Ubuntu 24.04 ships `liburing-dev`
 headers that are new enough to make Folly enable io_uring, but not new enough

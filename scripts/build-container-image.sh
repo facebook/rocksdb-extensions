@@ -251,10 +251,12 @@ ubuntu_proxy_preamble() {
     return
   fi
 
+  # Build args are visible to RUN instructions without becoming image ENV.
   cat <<EOF
-ENV https_proxy=http://[::1]:${PROXY_PORT} http_proxy=http://[::1]:${PROXY_PORT} no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1
-RUN echo 'Acquire::http::Proxy "http://[::1]:${PROXY_PORT}";' > /etc/apt/apt.conf.d/99proxy && \\
-    echo 'Acquire::https::Proxy "http://[::1]:${PROXY_PORT}";' >> /etc/apt/apt.conf.d/99proxy
+ARG https_proxy=http://[::1]:${PROXY_PORT}
+ARG http_proxy=http://[::1]:${PROXY_PORT}
+ARG no_proxy=localhost,127.0.0.1
+ARG NO_PROXY=localhost,127.0.0.1
 EOF
 }
 

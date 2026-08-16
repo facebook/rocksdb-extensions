@@ -7,11 +7,11 @@ integration build. RocksDB, Nimble, Folly, Velox, and their source-built
 transitive dependencies are still resolved by CMake `FetchContent` into the
 build tree.
 
-Ubuntu 24.04 is the default image because GitHub PR jobs run on
-`ubuntu-24.04`, so it is the closest match for CI. The CentOS Stream 9 image is
-kept because the local build was debugged and validated on a CentOS Stream 9
-dev host, which makes it useful for devvm parity and reproducing local package
-behavior.
+Ubuntu 24.04 is the default image because GitHub PR jobs use the
+`32-core-ubuntu` runner class with an Ubuntu 24.04 job container, so it is the
+closest match for CI. The CentOS Stream 9 image is kept because the local build
+was debugged and validated on a CentOS Stream 9 dev host, which makes it useful
+for devvm parity and reproducing local package behavior.
 
 `scripts/build-container-image.sh` is adapted from
 `/home/xbw/bin/rocksdb-docker-build.sh`. The original script builds upstream
@@ -29,7 +29,9 @@ The helper uses `podman` when available, otherwise `docker`. It uses the base
 image's normal apt sources. If the host shell has `http_proxy` or `https_proxy`
 set to Meta `fwdproxy`, the helper automatically starts a host-side apt proxy
 so package downloads do not depend on the build container reaching `fwdproxy`
-directly. Use `--devvm-proxy` to force this path, or `--no-proxy` to disable it.
+directly. These proxy settings apply only while building the image and are not
+stored in the resulting image. Use `--devvm-proxy` to force this path, or
+`--no-proxy` to disable it.
 
 Build all supported images:
 
