@@ -57,12 +57,14 @@ The workflow builds `rocksdb_extensions_nimble_test` and runs the filtered CTest
 entry for that binary.
 
 Both compiler jobs use the same `32-core-ubuntu` runner class as RocksDB's
-Folly CI jobs and build with up to 64 parallel compile processes. CI caches the
-FetchContent source trees and a compressed ccache directory. Cache identities
-include the resolved RocksDB and Nimble commits, compiler identity, container
-image, architecture, and dependency build configuration. An upstream revision
-or relevant build configuration change therefore creates a new cache instead
-of reusing incompatible objects.
+Folly CI jobs. The build script uses the runner's detected online CPU count for
+parallelism. CI caches the FetchContent source trees and a compressed ccache
+directory. Cache identities include the resolved RocksDB and Nimble commits,
+compiler identity, container image, architecture, and dependency build
+configuration. An upstream revision or relevant build configuration change
+therefore creates a new cache instead of reusing incompatible objects.
+Object caches roll forward by workflow commit, restoring the newest compatible
+cache so successful compilations can refresh the cached object set.
 
 The raw FetchContent build tree is intentionally not cached because a local
 RelWithDebInfo build is roughly 18 GB. Restoring source trees plus compiler

@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   linux-x86:
@@ -18,10 +17,6 @@ jobs:
       labels: 32-core-ubuntu
     container:
       image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --shm-size=16gb
     timeout-minutes: 120
     env:
       # Older devvm-built images contain a loopback proxy that is unreachable
@@ -32,10 +27,10 @@ jobs:
       NIMBLE_REVISION: acead744054eb006da753390ba80d3b6a29212ce
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
-      BUILD_JOBS: 64
+      # Preserve restored FetchContent sources and skip update checks for the
+      # commit-specific source cache.
       CLEAN_BUILD_DIRECTORY: OFF
       FETCHCONTENT_UPDATES_DISCONNECTED: ON
-      GH_TOKEN: ${{ github.token }}
     strategy:
       fail-fast: false
       matrix:

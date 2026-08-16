@@ -103,14 +103,6 @@ podman login ghcr.io -u <github-user>
 ./scripts/build-container-image.sh 24 --push
 ```
 
-After the first push, make the package readable by this repository's Actions
-token in GitHub:
-
-1. Open the `rocksdb-extensions_ubuntu` package in the `facebook` organization.
-2. Go to **Package settings**.
-3. Under **Manage Actions access**, add the `rocksdb-extensions` repository with
-   read access.
-
-The workflows use `ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0` as their
-job container and authenticate with `GITHUB_TOKEN`, so CI can pull the image
-once that package access is granted.
+Keep the `rocksdb-extensions_ubuntu` package public. The workflows use
+`ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0` as their job container and
+pull it without credentials.

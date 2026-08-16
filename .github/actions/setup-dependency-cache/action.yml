@@ -15,14 +15,6 @@ inputs:
     description: Nimble tag, branch, or commit used by the build
     required: true
 
-outputs:
-  source-cache-hit:
-    description: Whether the FetchContent source cache was restored
-    value: ${{ steps.cache-sources.outputs.cache-hit }}
-  object-cache-hit:
-    description: Whether the compiled object cache was restored
-    value: ${{ steps.cache-objects.outputs.cache-hit }}
-
 runs:
   using: composite
   steps:
@@ -30,7 +22,6 @@ runs:
       id: cache-key
       shell: bash
       env:
-        CACHE_COMPILER: ${{ inputs.compiler }}
         CACHE_CXX: ${{ inputs.cxx }}
         ROCKSDB_REVISION: ${{ inputs.rocksdb-revision }}
         NIMBLE_REVISION: ${{ inputs.nimble-revision }}
@@ -109,7 +100,6 @@ runs:
         object_hash="$(
           printf '%s\n' \
             "dependencies=${dependency_hash}" \
-            "compiler=${CACHE_COMPILER}" \
             "compiler-version=${compiler_version}" \
             "build-type=${CMAKE_BUILD_TYPE:-RelWithDebInfo}" \
             "cxx-flags=${CMAKE_CXX_FLAGS:-}" \
@@ -135,11 +125,11 @@ runs:
         echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
         echo "CCACHE_NOHASHDIR=true" >> "${GITHUB_ENV}"
         echo "CCACHE_COMPILERCHECK=content" >> "${GITHUB_ENV}"
-        echo "CCACHE_COMPRESS=true" >> "${GITHUB_ENV}"
+        # Two compiler-specific caches plus the source cache must share the
+        # repository's cache quota.
         echo "CCACHE_MAXSIZE=4G" >> "${GITHUB_ENV}"
 
     - name: Cache FetchContent sources
-      id: cache-sources
       uses: actions/cache@v4
       with:
         path: |
@@ -148,11 +138,12 @@ runs:
         key: dependency-sources-${{ runner.os }}-${{ runner.arch }}-${{ github.job_container.image }}-${{ steps.cache-key.outputs.dependency-hash }}
 
     - name: Cache compiled dependency objects
-      id: cache-objects
       uses: actions/cache@v4
       with:
         path: ${{ github.workspace }}/.ccache
-        key: dependency-objects-${{ runner.os }}-${{ runner.arch }}-${{ github.job_container.image }}-${{ inputs.compiler }}-${{ steps.cache-key.outputs.object-hash }}
+        key: dependency-objects-${{ runner.os }}-${{ runner.arch }}-${{ github.job_container.image }}-${{ inputs.compiler }}-${{ steps.cache-key.outputs.object-hash }}-${{ github.sha }}
+        restore-keys: |
+          dependency-objects-${{ runner.os }}-${{ runner.arch }}-${{ github.job_container.image }}-${{ inputs.compiler }}-${{ steps.cache-key.outputs.object-hash }}-
 
     - name: Initialize compiler cache
       shell: bash

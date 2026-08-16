@@ -351,7 +351,3 @@ ctest \
   --test-dir "${build_directory}" \
   -R '^rocksdb_extensions_nimble_test$' \
   --output-on-failure
-
-if [[ "${compiler_launcher}" != "none" ]]; then
-  ccache --show-stats || true
-fi

@@ -14,7 +14,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   build-latest:
@@ -23,10 +22,6 @@ jobs:
       labels: 32-core-ubuntu
     container:
       image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --shm-size=16gb
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -45,7 +40,8 @@ jobs:
       https_proxy: ""
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
-      BUILD_JOBS: 64
+      # Preserve restored FetchContent sources and skip update checks for the
+      # commit-specific source cache.
       CLEAN_BUILD_DIRECTORY: OFF
       FETCHCONTENT_UPDATES_DISCONNECTED: ON
       GH_TOKEN: ${{ github.token }}
