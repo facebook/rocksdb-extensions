@@ -1,6 +1,8 @@
-name: Latest dependency releases
+name: Weekly dependency updates
 
 on:
+  schedule:
+    - cron: "17 9 * * 1"
   workflow_dispatch:
     inputs:
       rocksdb_revision:
@@ -11,14 +13,110 @@ on:
         description: Optional Nimble tag, branch, or commit override
         required: false
         type: string
+      promote:
+        description: Open or update the RocksDB merge pull request after tests pass
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
   packages: read
 
+concurrency:
+  group: weekly-dependency-updates
+  cancel-in-progress: false
+
 jobs:
-  build-latest:
-    name: ${{ matrix.compiler }}
+  resolve:
+    name: Resolve dependency revisions
+    runs-on:
+      labels: 32-core-ubuntu
+    container:
+      image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+    outputs:
+      current_rocksdb_version: ${{ steps.current.outputs.rocksdb_version }}
+      current_rocksdb: ${{ steps.current.outputs.rocksdb_revision }}
+      current_nimble: ${{ steps.current.outputs.nimble_revision }}
+      latest_rocksdb_version: ${{ steps.latest.outputs.rocksdb_version }}
+      latest_rocksdb: ${{ steps.latest.outputs.rocksdb_revision }}
+      latest_nimble: ${{ steps.latest.outputs.nimble_revision }}
+      rocksdb_update: ${{ steps.compare.outputs.rocksdb_update }}
+      rocksdb_promotable: ${{ steps.compare.outputs.rocksdb_promotable }}
+      nimble_update: ${{ steps.compare.outputs.nimble_update }}
+    env:
+      http_proxy: ""
+      https_proxy: ""
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read promoted revisions
+        id: current
+        run: ./scripts/build-latest-releases.sh --locked --resolve-only >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve update candidates
+        id: latest
+        env:
+          ROCKSDB_REVISION: ${{ inputs.rocksdb_revision }}
+          # Standalone Nimble is frozen during its Velox migration. Scheduled
+          # runs retain the lock; workflow_dispatch may test an explicit ref.
+          NIMBLE_REVISION: ${{ inputs.nimble_revision || steps.current.outputs.nimble_revision }}
+        run: ./scripts/build-latest-releases.sh --resolve-only >> "${GITHUB_OUTPUT}"
+
+      - name: Compare revisions
+        id: compare
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CURRENT_ROCKSDB_VERSION: ${{ steps.current.outputs.rocksdb_version }}
+          CURRENT_ROCKSDB: ${{ steps.current.outputs.rocksdb_revision }}
+          CURRENT_NIMBLE: ${{ steps.current.outputs.nimble_revision }}
+          LATEST_ROCKSDB_VERSION: ${{ steps.latest.outputs.rocksdb_version }}
+          LATEST_ROCKSDB: ${{ steps.latest.outputs.rocksdb_revision }}
+          LATEST_NIMBLE: ${{ steps.latest.outputs.nimble_revision }}
+        run: |
+          rocksdb_update=false
+          rocksdb_promotable=false
+          current_version="${CURRENT_ROCKSDB_VERSION#v}"
+          latest_version="${LATEST_ROCKSDB_VERSION#v}"
+          if [[ "${current_version}" =~ ^[0-9]+(\.[0-9]+){1,2}$ &&
+            "${latest_version}" =~ ^[0-9]+(\.[0-9]+){1,2}$ &&
+            "$(printf '%s\n' "${current_version}" "${latest_version}" | LC_ALL=C sort -V | tail -n 1)" == "${latest_version}" &&
+            "${current_version}" != "${latest_version}" ]]; then
+            rocksdb_promotable=true
+          fi
+
+          if [[ "${CURRENT_ROCKSDB}" != "${LATEST_ROCKSDB}" ||
+            "${CURRENT_ROCKSDB_VERSION}" != "${LATEST_ROCKSDB_VERSION}" ]]; then
+            if [[ "${EVENT_NAME}" != "schedule" || "${rocksdb_promotable}" == "true" ]]; then
+              rocksdb_update=true
+            else
+              echo "::warning::Skipping non-forward RocksDB candidate ${LATEST_ROCKSDB_VERSION}."
+            fi
+          fi
+          echo "rocksdb_update=${rocksdb_update}" >> "${GITHUB_OUTPUT}"
+          echo "rocksdb_promotable=${rocksdb_promotable}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${CURRENT_NIMBLE}" == "${LATEST_NIMBLE}" ]]; then
+            echo "nimble_update=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "nimble_update=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+          {
+            echo "### Dependency candidates"
+            echo ""
+            echo "| Dependency | Promoted | Candidate |"
+            echo "| --- | --- | --- |"
+            echo "| RocksDB | \`${CURRENT_ROCKSDB_VERSION}\` (\`${CURRENT_ROCKSDB}\`) | \`${LATEST_ROCKSDB_VERSION}\` (\`${LATEST_ROCKSDB}\`) |"
+            echo "| Nimble | \`${CURRENT_NIMBLE}\` | \`${LATEST_NIMBLE}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  test_rocksdb:
+    name: RocksDB candidate / ${{ matrix.compiler }}
+    needs: resolve
+    if: needs.resolve.outputs.rocksdb_update == 'true'
     runs-on:
       labels: 32-core-ubuntu
     container:
@@ -35,41 +133,200 @@ jobs:
             cc: clang
             cxx: clang++
     env:
-      # Older devvm-built images contain a loopback proxy that is unreachable
-      # from GitHub-hosted job containers.
       http_proxy: ""
       https_proxy: ""
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
-      # Preserve restored FetchContent sources and skip update checks for the
-      # commit-specific source cache.
       CLEAN_BUILD_DIRECTORY: OFF
       FETCHCONTENT_UPDATES_DISCONNECTED: ON
-      GH_TOKEN: ${{ github.token }}
-      ROCKSDB_REVISION: ${{ inputs.rocksdb_revision }}
-      NIMBLE_REVISION: ${{ inputs.nimble_revision }}
+      ROCKSDB_REVISION: ${{ needs.resolve.outputs.latest_rocksdb }}
+      NIMBLE_REVISION: ${{ needs.resolve.outputs.current_nimble }}
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Resolve dependency revisions
-        id: revisions
-        run: ./scripts/build-latest-releases.sh --resolve-only >> "${GITHUB_OUTPUT}"
 
       - name: Restore dependency caches
         uses: ./.github/actions/setup-dependency-cache
         with:
           compiler: ${{ matrix.compiler }}
           cxx: ${{ matrix.cxx }}
-          rocksdb-revision: ${{ steps.revisions.outputs.rocksdb_revision }}
-          nimble-revision: ${{ steps.revisions.outputs.nimble_revision }}
+          rocksdb-revision: ${{ env.ROCKSDB_REVISION }}
+          nimble-revision: ${{ env.NIMBLE_REVISION }}
 
-      - name: Build and test latest releases
-        env:
-          ROCKSDB_REVISION: ${{ steps.revisions.outputs.rocksdb_revision }}
-          NIMBLE_REVISION: ${{ steps.revisions.outputs.nimble_revision }}
+      - name: Build and test RocksDB candidate
         run: ./scripts/build-latest-releases.sh
 
       - name: Report compiler cache statistics
         if: always()
         run: ccache --show-stats || true
+
+  test_nimble:
+    name: Nimble explicit candidate / ${{ matrix.compiler }}
+    needs: resolve
+    if: needs.resolve.outputs.nimble_update == 'true'
+    runs-on:
+      labels: 32-core-ubuntu
+    container:
+      image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+    env:
+      http_proxy: ""
+      https_proxy: ""
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      CLEAN_BUILD_DIRECTORY: OFF
+      FETCHCONTENT_UPDATES_DISCONNECTED: ON
+      ROCKSDB_REVISION: ${{ needs.resolve.outputs.current_rocksdb }}
+      NIMBLE_REVISION: ${{ needs.resolve.outputs.latest_nimble }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore dependency caches
+        uses: ./.github/actions/setup-dependency-cache
+        with:
+          compiler: ${{ matrix.compiler }}
+          cxx: ${{ matrix.cxx }}
+          rocksdb-revision: ${{ env.ROCKSDB_REVISION }}
+          nimble-revision: ${{ env.NIMBLE_REVISION }}
+
+      - name: Build and test Nimble candidate
+        run: ./scripts/build-latest-releases.sh
+
+      - name: Report compiler cache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+  promote_rocksdb:
+    name: Propose RocksDB update
+    needs:
+      - resolve
+      - test_rocksdb
+    if: >-
+      always() &&
+      (github.event_name == 'schedule' || inputs.promote == true) &&
+      github.ref_name == github.event.repository.default_branch &&
+      needs.resolve.outputs.rocksdb_update == 'true' &&
+      needs.resolve.outputs.rocksdb_promotable == 'true' &&
+      needs.test_rocksdb.result == 'success'
+    runs-on:
+      labels: 32-core-ubuntu
+    container:
+      image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      packages: read
+      pull-requests: write
+    env:
+      http_proxy: ""
+      https_proxy: ""
+      GH_TOKEN: ${{ secrets.DEPENDENCY_UPDATE_TOKEN }}
+      TESTED_BASE_SHA: ${{ github.sha }}
+      UPDATE_VERSION: ${{ needs.resolve.outputs.latest_rocksdb_version }}
+      UPDATE_REVISION: ${{ needs.resolve.outputs.latest_rocksdb }}
+      UPDATE_BRANCH: automation/weekly-rocksdb-release
+
+    steps:
+      - name: Require dependency update token
+        run: |
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "Configure the DEPENDENCY_UPDATE_TOKEN repository secret with contents and pull-request write access." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.DEPENDENCY_UPDATE_TOKEN }}
+
+      - name: Open, verify, and merge pull request
+        env:
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git config user.name "rocksdb-extensions dependency bot"
+          git config user.email "rocksdb-extensions-dependency-bot@users.noreply.github.com"
+          git switch --force-create "${UPDATE_BRANCH}" "${TESTED_BASE_SHA}"
+          ./scripts/update-dependency-lock.sh \
+            --rocksdb-version "${UPDATE_VERSION}" \
+            --rocksdb-revision "${UPDATE_REVISION}"
+
+          if git diff --quiet -- dependencies.lock; then
+            echo "RocksDB is already promoted to ${UPDATE_REVISION}."
+            exit 0
+          fi
+
+          git add dependencies.lock
+          git commit -m "Update RocksDB to ${UPDATE_VERSION}"
+          expected_head_commit="$(git rev-parse HEAD)"
+          commit_epoch="$(git show -s --format=%ct HEAD)"
+          minimum_check_start_epoch="$((commit_epoch - 10))"
+          remote_branch_sha="$(
+            git ls-remote --heads origin "refs/heads/${UPDATE_BRANCH}" |
+              cut -f1
+          )"
+          git push \
+            "--force-with-lease=refs/heads/${UPDATE_BRANCH}:${remote_branch_sha}" \
+            origin \
+            "HEAD:refs/heads/${UPDATE_BRANCH}"
+
+          pr_url="$(
+            gh pr list \
+              --base main \
+              --head "${UPDATE_BRANCH}" \
+              --state open \
+              --json url \
+              --jq '.[0].url'
+          )"
+          printf -v pr_body \
+            'Weekly dependency validation passed with GCC and Clang.\n\nCandidate: `%s` (`%s`)\nValidation run: %s\n\nThe bot will merge only after the pull request reports passing `gcc` and `clang` checks.' \
+            "${UPDATE_VERSION}" \
+            "${UPDATE_REVISION}" \
+            "${WORKFLOW_RUN_URL}"
+          if [[ -z "${pr_url}" ]]; then
+            pr_url="$(
+              gh pr create \
+                --base main \
+                --head "${UPDATE_BRANCH}" \
+                --title "Update RocksDB to ${UPDATE_VERSION}" \
+                --body "${pr_body}"
+            )"
+          else
+            gh pr edit "${pr_url}" \
+              --title "Update RocksDB to ${UPDATE_VERSION}" \
+              --body "${pr_body}"
+          fi
+          if [[ "$(
+            gh pr view "${pr_url}" \
+              --json autoMergeRequest \
+              --jq '.autoMergeRequest != null'
+          )" == "true" ]]; then
+            gh pr merge "${pr_url}" --disable-auto
+          fi
+          ./scripts/wait-for-pr-checks.sh \
+            "${pr_url}" \
+            "${expected_head_commit}" \
+            "${minimum_check_start_epoch}" \
+            gcc \
+            clang
+          merge_state="$(
+            gh pr view "${pr_url}" --json mergeStateStatus --jq '.mergeStateStatus'
+          )"
+          if [[ "${merge_state}" == "BEHIND" || "${merge_state}" == "DIRTY" ]]; then
+            echo "Pull request is not current with main (state ${merge_state}); refusing to merge." >&2
+            exit 1
+          fi
+          gh pr merge "${pr_url}" \
+            --match-head-commit "${expected_head_commit}" \
+            --squash \
+            --delete-branch

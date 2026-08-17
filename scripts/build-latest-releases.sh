@@ -13,60 +13,137 @@ REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 readonly REPOSITORY_ROOT
 
 resolve_only=0
-case "${1:-}" in
-  "")
-    ;;
-  --resolve-only)
-    resolve_only=1
-    ;;
-  *)
-    echo "Usage: $0 [--resolve-only]" >&2
-    exit 1
-    ;;
-esac
+use_locked_revisions=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resolve-only)
+      resolve_only=1
+      ;;
+    --locked)
+      use_locked_revisions=1
+      ;;
+    *)
+      echo "Usage: $0 [--locked] [--resolve-only]" >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
 
-resolve_latest_revision() {
+dependency_lock_file="${DEPENDENCY_LOCK_FILE:-${REPOSITORY_ROOT}/dependencies.lock}"
+if [[ ! -f "${dependency_lock_file}" ]]; then
+  echo "Dependency lock file not found: ${dependency_lock_file}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090,SC1091 # The lock path can be overridden by CI tests.
+source "${dependency_lock_file}"
+
+if [[ -z "${LOCKED_ROCKSDB_VERSION:-}" ||
+  ! "${LOCKED_ROCKSDB_REVISION:-}" =~ ^[0-9a-fA-F]{40}$ ||
+  ! "${LOCKED_NIMBLE_REVISION:-}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  echo "${dependency_lock_file} must define LOCKED_ROCKSDB_VERSION and exact 40-character dependency commits." >&2
+  exit 1
+fi
+
+require_gh() {
   local repository="$1"
-  local default_branch
-  local release_tag
-  local stable_tag
-  local tags
 
-  if ! command -v gh >/dev/null 2>&1; then
-    echo "The GitHub CLI (gh) is required to resolve ${repository}'s latest revision." >&2
-    echo "Install gh or set ROCKSDB_REVISION and NIMBLE_REVISION explicitly." >&2
-    return 1
+  if command -v gh >/dev/null 2>&1; then
+    return
   fi
 
-  if release_tag="$(
-    gh api "repos/${repository}/releases/latest" --jq '.tag_name' 2>/dev/null
-  )" && [[ -n "${release_tag}" ]]; then
-    printf '%s\n' "${release_tag}"
+  echo "The GitHub CLI (gh) is required to resolve ${repository}'s revision." >&2
+  echo "Install gh or set both dependency revisions to exact 40-character commits." >&2
+  return 1
+}
+
+resolve_revision_to_commit() {
+  local repository="$1"
+  local revision="$2"
+  local commit
+
+  if [[ "${revision}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    printf '%s\n' "${revision,,}"
     return
+  fi
+
+  require_gh "${repository}"
+  commit="$(
+    gh api "repos/${repository}/commits/${revision}" --jq '.sha' 2>/dev/null
+  )"
+  if [[ ! "${commit}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    echo "Could not resolve ${repository} revision ${revision} to a commit." >&2
+    return 1
+  fi
+  printf '%s\n' "${commit,,}"
+}
+
+resolve_latest_stable_revision() {
+  local repository="$1"
+  local release_tags
+  local stable_revision
+  local tags
+
+  require_gh "${repository}"
+
+  if release_tags="$(
+    gh api --paginate "repos/${repository}/releases" \
+      --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+      2>/dev/null
+  )"; then
+    stable_revision="$(
+      printf '%s\n' "${release_tags}" |
+        { grep -E '^v?[0-9]+(\.[0-9]+){1,2}$' || true; } |
+        LC_ALL=C sort -V |
+        tail -n 1
+    )"
+    if [[ -n "${stable_revision}" ]]; then
+      printf '%s\n' "${stable_revision}"
+      return
+    fi
   fi
 
   if tags="$(
     gh api --paginate "repos/${repository}/tags" --jq '.[].name' 2>/dev/null
   )"; then
-    stable_tag="$(
+    stable_revision="$(
       printf '%s\n' "${tags}" |
         { grep -E '^v?[0-9]+(\.[0-9]+){1,2}$' || true; } |
         LC_ALL=C sort -V |
         tail -n 1
     )"
-    if [[ -n "${stable_tag}" ]]; then
-      echo "${repository} has no GitHub Release; using stable tag ${stable_tag}." >&2
-      printf '%s\n' "${stable_tag}"
+    if [[ -n "${stable_revision}" ]]; then
+      echo "${repository} has no stable GitHub Release; using stable tag ${stable_revision}." >&2
+      printf '%s\n' "${stable_revision}"
       return
     fi
   fi
 
+  echo "Could not resolve a stable release or version tag for ${repository}." >&2
+  return 1
+}
+
+resolve_latest_revision() {
+  local repository="$1"
+  local default_branch
+  local stable_revision
+
+  if stable_revision="$(resolve_latest_stable_revision "${repository}")"; then
+    printf '%s\n' "${stable_revision}"
+    return
+  fi
+
+  require_gh "${repository}"
   if default_branch="$(
     gh api "repos/${repository}" --jq '.default_branch' 2>/dev/null
   )" && [[ -n "${default_branch}" ]]; then
-    echo "${repository} has no GitHub Release or stable version tag; using default branch ${default_branch}." >&2
-    printf '%s\n' "${default_branch}"
-    return
+    if stable_revision="$(
+      resolve_revision_to_commit "${repository}" "${default_branch}"
+    )"; then
+      echo "${repository} has no stable release or version tag; using ${default_branch} commit ${stable_revision}." >&2
+      printf '%s\n' "${stable_revision}"
+      return
+    fi
   fi
 
   echo "Could not resolve a release, stable tag, or default branch for ${repository}." >&2
@@ -74,17 +151,40 @@ resolve_latest_revision() {
   return 1
 }
 
-rocksdb_revision="${ROCKSDB_REVISION:-${ROCKSDB_RELEASE_TAG:-}}"
-if [[ -z "${rocksdb_revision}" ]]; then
-  rocksdb_revision="$(resolve_latest_revision facebook/rocksdb)"
-fi
+rocksdb_version=""
+rocksdb_revision=""
+nimble_revision=""
+if [[ "${use_locked_revisions}" != "0" ]]; then
+  rocksdb_version="${LOCKED_ROCKSDB_VERSION}"
+  rocksdb_revision="${LOCKED_ROCKSDB_REVISION,,}"
+  nimble_revision="${LOCKED_NIMBLE_REVISION,,}"
+else
+  rocksdb_ref="${ROCKSDB_REVISION:-${ROCKSDB_RELEASE_TAG:-}}"
+  if [[ -z "${rocksdb_ref}" ]]; then
+    rocksdb_ref="$(resolve_latest_stable_revision facebook/rocksdb)"
+  fi
+  rocksdb_version="${ROCKSDB_VERSION:-${rocksdb_ref}}"
 
-nimble_revision="${NIMBLE_REVISION:-${NIMBLE_RELEASE_TAG:-}}"
-if [[ -z "${nimble_revision}" ]]; then
-  nimble_revision="$(resolve_latest_revision facebookincubator/nimble)"
+  nimble_ref="${NIMBLE_REVISION:-${NIMBLE_RELEASE_TAG:-}}"
+  if [[ -z "${nimble_ref}" ]]; then
+    nimble_ref="$(resolve_latest_revision facebookincubator/nimble)"
+  fi
+
+  if [[ "${resolve_only}" != "0" ]]; then
+    rocksdb_revision="$(
+      resolve_revision_to_commit facebook/rocksdb "${rocksdb_ref}"
+    )"
+    nimble_revision="$(
+      resolve_revision_to_commit facebookincubator/nimble "${nimble_ref}"
+    )"
+  else
+    rocksdb_revision="${rocksdb_ref}"
+    nimble_revision="${nimble_ref}"
+  fi
 fi
 
 if [[ "${resolve_only}" != "0" ]]; then
+  printf 'rocksdb_version=%s\n' "${rocksdb_version}"
   printf 'rocksdb_revision=%s\n' "${rocksdb_revision}"
   printf 'nimble_revision=%s\n' "${nimble_revision}"
   exit 0
@@ -334,6 +434,7 @@ cmake \
   -DGFLAGS_USE_TARGET_NAMESPACE:BOOL="${gflags_use_target_namespace}" \
   -DROCKSDB_EXTENSIONS_BUILD_TESTS=ON \
   -DROCKSDB_EXTENSIONS_FETCH_DEPS=ON \
+  -DROCKSDB_EXTENSIONS_REQUIRE_NIMBLE_PINNED_VELOX=ON \
   -DROCKSDB_EXTENSIONS_ROCKSDB_GIT_TAG="${rocksdb_revision}" \
   -DROCKSDB_EXTENSIONS_NIMBLE_GIT_TAG="${nimble_revision}"
 

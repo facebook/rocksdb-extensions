@@ -80,18 +80,17 @@ podman run --rm -it \
   -v "$PWD:/workspace/rocksdb-extensions:Z" \
   -w /workspace/rocksdb-extensions \
   ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0 \
-  ./scripts/build-latest-releases.sh
+  ./scripts/build-latest-releases.sh --locked
 ```
 
-Pass explicit revisions if the container cannot authenticate `gh api` or if you
-want a reproducible build independent of the latest upstream tags:
+Pass explicit revisions to test a different dependency pair:
 
 ```bash
 podman run --rm -it \
   -v "$PWD:/workspace/rocksdb-extensions:Z" \
   -w /workspace/rocksdb-extensions \
   -e ROCKSDB_REVISION=v11.8.0 \
-  -e NIMBLE_REVISION=acead744054eb006da753390ba80d3b6a29212ce \
+  -e NIMBLE_REVISION=<nimble-commit> \
   ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0 \
   ./scripts/build-latest-releases.sh
 ```

@@ -24,8 +24,6 @@ jobs:
       # from GitHub-hosted job containers.
       http_proxy: ""
       https_proxy: ""
-      ROCKSDB_REVISION: v11.8.0
-      NIMBLE_REVISION: acead744054eb006da753390ba80d3b6a29212ce
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
       # Preserve restored FetchContent sources and skip update checks for the
@@ -48,7 +46,7 @@ jobs:
 
       - name: Resolve dependency revisions
         id: revisions
-        run: ./scripts/build-latest-releases.sh --resolve-only >> "${GITHUB_OUTPUT}"
+        run: ./scripts/build-latest-releases.sh --locked --resolve-only >> "${GITHUB_OUTPUT}"
 
       - name: Restore dependency caches
         uses: ./.github/actions/setup-dependency-cache

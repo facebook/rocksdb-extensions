@@ -351,11 +351,9 @@ validate_image() {
     "${run_args[@]}" \
     -v "${REPOSITORY_ROOT}:/workspace/rocksdb-extensions:Z" \
     -w /workspace/rocksdb-extensions \
-    -e ROCKSDB_REVISION="${ROCKSDB_REVISION:-v11.8.0}" \
-    -e NIMBLE_REVISION="${NIMBLE_REVISION:-acead744054eb006da753390ba80d3b6a29212ce}" \
     -e CLEAN_BUILD_DIRECTORY=ON \
     "${tag}" \
-    ./scripts/build-latest-releases.sh
+    ./scripts/build-latest-releases.sh --locked
 }
 
 push_image() {
