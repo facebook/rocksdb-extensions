@@ -19,6 +19,11 @@ set(ROCKSDB_EXTENSIONS_VELOX_SOURCE_DIR "" CACHE PATH "Optional local Velox sour
 set(ROCKSDB_EXTENSIONS_NIMBLE_GIT_REPOSITORY "https://github.com/facebookincubator/nimble.git" CACHE STRING "Nimble repository")
 set(ROCKSDB_EXTENSIONS_NIMBLE_GIT_TAG "main" CACHE STRING "Nimble revision")
 set(ROCKSDB_EXTENSIONS_NIMBLE_SOURCE_DIR "" CACHE PATH "Optional local Nimble source directory")
+set(
+  ROCKSDB_EXTENSIONS_REQUIRE_NIMBLE_PINNED_VELOX
+  OFF
+  CACHE BOOL
+  "Require fetched Nimble to provide its pinned Velox targets")
 set(ROCKSDB_EXTENSIONS_FLATBUFFERS_GIT_REPOSITORY "https://github.com/google/flatbuffers.git" CACHE STRING "FlatBuffers repository")
 set(ROCKSDB_EXTENSIONS_FLATBUFFERS_GIT_TAG "v25.2.10" CACHE STRING "FlatBuffers revision")
 
@@ -27,11 +32,15 @@ function(rocksdb_extensions_fetch_dependency name repository tag)
     return()
   endif()
 
+  set(git_shallow_args)
+  if(NOT "${tag}" MATCHES "^[0-9a-fA-F]{7,40}$")
+    set(git_shallow_args GIT_SHALLOW TRUE)
+  endif()
   FetchContent_Declare(
     ${name}
     GIT_REPOSITORY ${repository}
     GIT_TAG ${tag}
-    GIT_SHALLOW TRUE)
+    ${git_shallow_args})
   FetchContent_MakeAvailable(${name})
 endfunction()
 
@@ -159,6 +168,7 @@ set(VELOX_ENABLE_GEO OFF CACHE BOOL "" FORCE)
 set(VELOX_ENABLE_PARQUET OFF CACHE BOOL "" FORCE)
 
 find_package(nimble CONFIG QUIET)
+set(ROCKSDB_EXTENSIONS_NIMBLE_FETCHED FALSE)
 if(NOT TARGET nimble_index_projector AND NOT TARGET nimble::nimble)
   set(NIMBLE_BUILD_TESTING OFF CACHE BOOL "" FORCE)
   set(NIMBLE_ENABLE_BENCHMARKS OFF CACHE BOOL "" FORCE)
@@ -172,11 +182,20 @@ if(NOT TARGET nimble_index_projector AND NOT TARGET nimble::nimble AND NOT ROCKS
     nimble
     ${ROCKSDB_EXTENSIONS_NIMBLE_GIT_REPOSITORY}
     ${ROCKSDB_EXTENSIONS_NIMBLE_GIT_TAG})
+  set(ROCKSDB_EXTENSIONS_NIMBLE_FETCHED TRUE)
 endif()
 
 # A source build of Nimble adds the Velox submodule revision that Nimble pins.
 # Resolve Velox only after Nimble so CMake does not add an independent Velox
 # checkout first and then fail when Nimble creates the same targets again.
+if(ROCKSDB_EXTENSIONS_REQUIRE_NIMBLE_PINNED_VELOX AND
+   ROCKSDB_EXTENSIONS_NIMBLE_FETCHED AND
+   NOT TARGET velox_dwio_common)
+  message(FATAL_ERROR
+    "The fetched Nimble revision did not provide its pinned Velox targets. "
+    "Release validation refuses to fall back to a moving Velox revision; "
+    "promote Nimble and Velox as an explicit compatible set instead.")
+endif()
 find_package(velox CONFIG QUIET)
 if(NOT TARGET velox_dwio_common)
   rocksdb_extensions_add_source_dependency(

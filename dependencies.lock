@@ -1,0 +1,7 @@
+# Dependency revisions validated by pull request CI.
+#
+# Revisions are exact commits. The RocksDB version is display metadata for the
+# corresponding release commit.
+LOCKED_ROCKSDB_VERSION=v11.8.0
+LOCKED_ROCKSDB_REVISION=abeebd9630f11bd08c28b7bd43c7bdfc62050654
+LOCKED_NIMBLE_REVISION=acead744054eb006da753390ba80d3b6a29212ce
