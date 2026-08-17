@@ -24,7 +24,7 @@ bool isAligned(const void *value, size_t alignment) {
   return reinterpret_cast<uintptr_t>(value) % alignment == 0;
 }
 
-void copyBytes(char *destination, size_t destinationSize, const char *source,
+void copyBytes(void *destination, size_t destinationSize, const char *source,
                size_t size) {
   VELOX_CHECK_LE(size, destinationSize);
   std::memcpy(destination, source, size);

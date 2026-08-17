@@ -20,6 +20,18 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+To test the latest available RocksDB and Nimble revisions through the
+`FetchContent` dependency path, run:
+
+```bash
+./scripts/build-latest-releases.sh
+```
+
+The script accepts `ROCKSDB_REVISION` and `NIMBLE_REVISION` environment
+variables for reproducible or pre-release compatibility testing. See
+[`docs/dependency-release-automation.md`](../docs/dependency-release-automation.md)
+for the automated version-promotion plan.
+
 The default and preferred dependency mode is installed CMake package targets.
 Install RocksDB, Folly, Velox, Nimble, fmt, and GTest into one or more prefixes,
 then pass those prefixes through `CMAKE_PREFIX_PATH`. The build expects those
@@ -43,7 +55,12 @@ revisions are cache variables:
 -DROCKSDB_EXTENSIONS_FOLLY_GIT_TAG=main
 -DROCKSDB_EXTENSIONS_VELOX_GIT_TAG=main
 -DROCKSDB_EXTENSIONS_NIMBLE_GIT_TAG=main
+-DROCKSDB_EXTENSIONS_FLATBUFFERS_GIT_TAG=v25.2.10
 ```
+
+Velox owns its compatible Folly and fmt revisions when Velox is built from
+source. The Folly repository and tag variables are only used as a fallback when
+the selected Velox package does not provide a Folly target.
 
 You can also point the build at already-cloned standalone dependency source
 trees:
@@ -59,9 +76,10 @@ Each source directory must contain the dependency's top-level `CMakeLists.txt`
 and be usable through plain CMake `add_subdirectory()`. Generated CMake
 fragments that require non-standalone macros are not valid `*_SOURCE_DIR`
 overrides; provide installed package targets for those builds or use standalone
-source checkouts. The build validates the concrete CMake targets it expects from
-Velox and Nimble during configure. If a dependency revision uses different
-target names, override `ROCKSDB_EXTENSIONS_VELOX_TARGETS`,
+source checkouts. When Velox is built from source, its Folly dependency takes
+precedence over `ROCKSDB_EXTENSIONS_FOLLY_SOURCE_DIR`. The build validates the
+concrete CMake targets it expects from Velox and Nimble during configure. If a
+dependency revision uses different target names, override `ROCKSDB_EXTENSIONS_VELOX_TARGETS`,
 `ROCKSDB_EXTENSIONS_NIMBLE_TARGETS`, or
 `ROCKSDB_EXTENSIONS_NIMBLE_TEST_TARGETS`.
 

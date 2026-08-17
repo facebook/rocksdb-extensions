@@ -19,14 +19,14 @@
 
 #include <gtest/gtest.h>
 
-#include "dwio/nimble/index/IndexConfig.h"
+#include "dwio/nimble/index/ClusterIndexConfig.h"
 #include "dwio/nimble/serializer/Deserializer.h"
 #include "dwio/nimble/tablet/TabletReaderCache.h"
-#include "dwio/nimble/velox/FlushPolicy.h"
+#include "dwio/nimble/writer/FlushPolicy.h"
 #include "dwio/nimble/velox/SchemaUtils.h"
 #include "dwio/nimble/velox/VeloxReader.h"
-#include "dwio/nimble/velox/VeloxWriter.h"
-#include "dwio/nimble/velox/VeloxWriterOptions.h"
+#include "dwio/nimble/writer/VeloxWriter.h"
+#include "dwio/nimble/writer/VeloxWriterOptions.h"
 #include "folly/executors/CPUThreadPoolExecutor.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
@@ -44,6 +44,7 @@
 #include "velox/serializers/KeyEncoder.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/FlatVector.h"
+#include "velox/vector/SimpleVector.h"
 
 namespace facebook::rocks {
 namespace {
@@ -135,13 +136,26 @@ protected:
 
     nimble::VeloxWriterOptions options;
     options.enableChunking = true;
+    nimble::CompressionOptions compressionOptions;
+    compressionOptions.compressionType = nimble::CompressionType::Zstd;
+    compressionOptions.zstdMinCompressionSize = 0;
+    options.compressionOptions = compressionOptions;
+    options.encodingSelectionPolicyCreator =
+        [factory = nimble::ManualEncodingSelectionPolicyFactory{
+             nimble::ManualEncodingSelectionPolicyFactory::
+                 defaultEncodingReadFactors(),
+             compressionOptions}](nimble::DataType dataType)
+        -> std::unique_ptr<nimble::EncodingSelectionPolicyBase> {
+      return factory.createPolicy(dataType);
+    };
 
-    nimble::ClusterIndexConfig indexConfig;
-    indexConfig.columns = {"key"};
-    indexConfig.sortOrders = {nimble::SortOrder{.ascending = true}};
-    indexConfig.enforceKeyOrder = true;
-    indexConfig.noDuplicateKey = true;
-    options.clusterIndexConfig = std::move(indexConfig);
+    options.clusterIndexConfig =
+        nimble::index::ClusterIndexConfigBuilder{}
+            .withKeyColumns({"key"})
+            .withSortOrders({nimble::SortOrder{.ascending = true}})
+            .withEnforceKeyOrder(true)
+            .withNoDuplicateKey(true)
+            .build();
     options.flushPolicyFactory = [] {
       return std::make_unique<nimble::LambdaFlushPolicy>(
           [](const nimble::StripeProgress &progress) {
@@ -222,13 +236,12 @@ protected:
       auto *rowVector = batch->as<velox::RowVector>();
       VELOX_CHECK_NOT_NULL(rowVector);
       for (size_t column = 0; column < projection.size(); ++column) {
-        auto *flat =
-            rowVector->childAt(column)->as<velox::FlatVector<int64_t>>();
-        VELOX_CHECK_NOT_NULL(flat);
+        const auto *vector =
+            loadInt64Vector(rowVector->childAt(projection[column] + 1));
         auto &output = values[column];
         output.reserve(output.size() + rowVector->size());
         for (velox::vector_size_t row = 0; row < rowVector->size(); ++row) {
-          output.push_back(flat->valueAt(row));
+          output.push_back(readInt64Value(*vector, row));
         }
       }
     }
@@ -281,6 +294,7 @@ protected:
         const auto *chunk = GetNimbleResultIOBuf(kv.second);
         VELOX_CHECK_NOT_NULL(chunk);
         auto rowRange = readResultRowRange(*chunk);
+        auto stripeRowCount = readResultChunkRowCount(*chunk);
         auto coalesced = chunk->cloneCoalescedAsValue();
 
         nimble::DeserializerOptions deserOptions;
@@ -294,22 +308,26 @@ protected:
             decoded);
         auto *rowVector = decoded->as<velox::RowVector>();
         VELOX_CHECK_NOT_NULL(rowVector);
-        VELOX_CHECK_GE(rowVector->size(), rowRange.endRow);
+        VELOX_CHECK_GE(stripeRowCount, rowRange.endRow);
+        VELOX_CHECK_EQ(rowVector->size(), rowRange.numRows());
+        std::vector<const velox::SimpleVector<int64_t> *> resultColumns;
+        resultColumns.reserve(projection.size());
+        for (size_t column = 0; column < projection.size(); ++column) {
+          resultColumns.push_back(loadInt64Vector(rowVector->childAt(column)));
+        }
 
-        for (uint32_t stripeRow = rowRange.startRow;
-             stripeRow < rowRange.endRow; ++stripeRow) {
+        for (velox::vector_size_t resultRow = 0; resultRow < rowVector->size();
+             ++resultRow) {
           VELOX_CHECK_LT(rowsSeen, expectedRows.size());
           const auto expectedRow = expectedRows[rowsSeen];
           for (size_t column = 0; column < projection.size(); ++column) {
-            auto *flat =
-                rowVector->childAt(column)->as<velox::FlatVector<int64_t>>();
-            VELOX_CHECK_NOT_NULL(flat);
-            EXPECT_EQ(flat->valueAt(stripeRow),
-                      directValues[column][expectedRow])
+            const auto value = readInt64Value(*resultColumns[column], resultRow);
+            EXPECT_EQ(value, directValues[column][expectedRow])
                 << "row=" << rowsSeen << " column=" << projection[column];
             EXPECT_EQ(
-                flat->valueAt(stripeRow),
-                valueFor(static_cast<int64_t>(expectedRow), projection[column]));
+                value,
+                valueFor(static_cast<int64_t>(expectedRow), projection[column]))
+                << "row=" << rowsSeen << " column=" << projection[column];
           }
           ++rowsSeen;
         }
@@ -324,6 +342,22 @@ protected:
 
   static int64_t valueFor(int64_t row, int column) {
     return row * 1'000 + column;
+  }
+
+  static const velox::SimpleVector<int64_t> *
+  loadInt64Vector(const velox::VectorPtr &vector) {
+    VELOX_CHECK_NOT_NULL(vector);
+    auto *loaded = vector->loadedVector();
+    VELOX_CHECK_NOT_NULL(loaded);
+    auto *simple = loaded->as<velox::SimpleVector<int64_t>>();
+    VELOX_CHECK_NOT_NULL(simple);
+    return simple;
+  }
+
+  static int64_t readInt64Value(const velox::SimpleVector<int64_t> &vector,
+                                velox::vector_size_t row) {
+    VELOX_CHECK(!vector.isNullAt(row));
+    return vector.valueAt(row);
   }
 
   template <typename ValueAt>

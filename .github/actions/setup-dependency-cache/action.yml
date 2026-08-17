@@ -1,0 +1,154 @@
+name: Setup dependency cache
+description: Cache FetchContent sources and compiled dependency objects
+
+inputs:
+  compiler:
+    description: Compiler matrix name used to separate object caches
+    required: true
+  cxx:
+    description: C++ compiler executable used to fingerprint the toolchain
+    required: true
+  rocksdb-revision:
+    description: RocksDB tag, branch, or commit used by the build
+    required: true
+  nimble-revision:
+    description: Nimble tag, branch, or commit used by the build
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Compute dependency cache identity
+      id: cache-key
+      shell: bash
+      env:
+        CACHE_CXX: ${{ inputs.cxx }}
+        ROCKSDB_REVISION: ${{ inputs.rocksdb-revision }}
+        NIMBLE_REVISION: ${{ inputs.nimble-revision }}
+      run: |
+        set -euo pipefail
+
+        resolve_remote_ref() {
+          local repository="$1"
+          local revision="$2"
+          local matches
+          local sha
+          local ref
+          local direct_sha=""
+          local branch_sha=""
+          local tag_sha=""
+          local peeled_tag_sha=""
+
+          if [[ "${revision}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+            printf '%s\n' "${revision,,}"
+            return
+          fi
+
+          matches="$(
+            git ls-remote "https://github.com/${repository}.git" \
+              "${revision}" \
+              "refs/heads/${revision}" \
+              "refs/tags/${revision}" \
+              "refs/tags/${revision}^{}"
+          )"
+
+          while read -r sha ref; do
+            case "${ref}" in
+              "${revision}")
+                direct_sha="${sha}"
+                ;;
+              "refs/heads/${revision}")
+                branch_sha="${sha}"
+                ;;
+              "refs/tags/${revision}")
+                tag_sha="${sha}"
+                ;;
+              "refs/tags/${revision}^{}")
+                peeled_tag_sha="${sha}"
+                ;;
+            esac
+          done <<< "${matches}"
+
+          sha="${peeled_tag_sha:-${branch_sha:-${tag_sha:-${direct_sha}}}}"
+          if [[ -z "${sha}" ]]; then
+            echo "Could not resolve ${repository} revision ${revision} for the cache key." >&2
+            return 1
+          fi
+          printf '%s\n' "${sha}"
+        }
+
+        rocksdb_commit="$(resolve_remote_ref facebook/rocksdb "${ROCKSDB_REVISION}")"
+        nimble_commit="$(resolve_remote_ref facebookincubator/nimble "${NIMBLE_REVISION}")"
+        configuration_hash="$(
+          sha256sum \
+            CMakeLists.txt \
+            cmake/Dependencies.cmake \
+            nimble/CMakeLists.txt \
+            scripts/build-latest-releases.sh |
+            sha256sum |
+            cut -d' ' -f1
+        )"
+        dependency_hash="$(
+          printf '%s\n' \
+            "rocksdb=${rocksdb_commit}" \
+            "nimble=${nimble_commit}" \
+            "configuration=${configuration_hash}" |
+            sha256sum |
+            cut -d' ' -f1
+        )"
+        compiler_version="$("${CACHE_CXX}" --version | head -n 1)"
+        object_hash="$(
+          printf '%s\n' \
+            "dependencies=${dependency_hash}" \
+            "compiler-version=${compiler_version}" \
+            "build-type=${CMAKE_BUILD_TYPE:-RelWithDebInfo}" \
+            "cxx-flags=${CMAKE_CXX_FLAGS:-}" \
+            "cxx-extensions=${CMAKE_CXX_EXTENSIONS:-ON}" \
+            "force-gnu-cxx20=${FORCE_GNU_CXX20:-ON}" \
+            "disable-liburing=${FOLLY_FORCE_DISABLE_LIBURING:-ON}" \
+            "force-sse42=${FORCE_X86_SSE42:-ON}" \
+            "gflags-target-namespace=${GFLAGS_USE_TARGET_NAMESPACE:-OFF}" |
+            sha256sum |
+            cut -d' ' -f1
+        )"
+
+        echo "dependency-hash=${dependency_hash}" >> "${GITHUB_OUTPUT}"
+        echo "object-hash=${object_hash}" >> "${GITHUB_OUTPUT}"
+        echo "RocksDB cache commit: ${rocksdb_commit}"
+        echo "Nimble cache commit:  ${nimble_commit}"
+        echo "Compiler identity:    ${compiler_version}"
+
+    - name: Set compiler cache environment
+      shell: bash
+      run: |
+        echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache" >> "${GITHUB_ENV}"
+        echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+        echo "CCACHE_NOHASHDIR=true" >> "${GITHUB_ENV}"
+        echo "CCACHE_COMPILERCHECK=content" >> "${GITHUB_ENV}"
+        # Two compiler-specific caches plus the source cache must share the
+        # repository's cache quota.
+        echo "CCACHE_MAXSIZE=4G" >> "${GITHUB_ENV}"
+
+    - name: Cache FetchContent sources
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ github.workspace }}/build-latest-releases/_deps/*-src
+          ${{ github.workspace }}/build-latest-releases/_deps/*-subbuild
+        key: dependency-sources-${{ runner.os }}-${{ runner.arch }}-${{ github.job_container.image }}-${{ steps.cache-key.outputs.dependency-hash }}
+
+    - name: Cache compiled dependency objects
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: dependency-objects-${{ runner.os }}-${{ runner.arch }}-${{ github.job_container.image }}-${{ inputs.compiler }}-${{ steps.cache-key.outputs.object-hash }}-${{ github.sha }}
+        restore-keys: |
+          dependency-objects-${{ runner.os }}-${{ runner.arch }}-${{ github.job_container.image }}-${{ inputs.compiler }}-${{ steps.cache-key.outputs.object-hash }}-
+
+    - name: Initialize compiler cache
+      shell: bash
+      run: |
+        command -v ccache >/dev/null
+        mkdir -p "${CCACHE_DIR}"
+        ccache --max-size "${CCACHE_MAXSIZE}"
+        ccache --zero-stats
