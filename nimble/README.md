@@ -20,15 +20,24 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-To test the latest available RocksDB and Nimble revisions through the
-`FetchContent` dependency path, run:
+To test the promoted RocksDB and Nimble revisions from `dependencies.lock`
+through the `FetchContent` dependency path, run:
+
+```bash
+./scripts/build-latest-releases.sh --locked
+```
+
+To test the latest available upstream revisions, run:
 
 ```bash
 ./scripts/build-latest-releases.sh
 ```
 
 The script accepts `ROCKSDB_REVISION` and `NIMBLE_REVISION` environment
-variables for reproducible or pre-release compatibility testing. See
+variables for reproducible or pre-release compatibility testing. The weekly
+workflow promotes forward RocksDB releases after the GCC and Clang builds pass.
+Nimble stays at its validated commit until the public Velox migration is ready;
+specific immutable Nimble commits can still be tested manually. See
 [`docs/dependency-release-automation.md`](../docs/dependency-release-automation.md)
 for the automated version-promotion plan.
 

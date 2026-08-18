@@ -5,8 +5,14 @@ inputs:
   compiler:
     description: Compiler matrix name used to separate object caches
     required: true
+  cc:
+    description: C compiler executable used to fingerprint the toolchain
+    required: true
   cxx:
     description: C++ compiler executable used to fingerprint the toolchain
+    required: true
+  container-image:
+    description: Container image reference used by the build
     required: true
   rocksdb-revision:
     description: RocksDB tag, branch, or commit used by the build
@@ -15,6 +21,14 @@ inputs:
     description: Nimble tag, branch, or commit used by the build
     required: true
 
+outputs:
+  source-cache-hit:
+    description: Whether the exact FetchContent source cache key was restored
+    value: ${{ steps.source-cache.outputs.cache-hit }}
+  object-cache-hit:
+    description: Whether the exact compiler object cache key was restored
+    value: ${{ steps.object-cache.outputs.cache-hit }}
+
 runs:
   using: composite
   steps:
@@ -22,11 +36,22 @@ runs:
       id: cache-key
       shell: bash
       env:
+        CACHE_CC: ${{ inputs.cc }}
+        CACHE_COMPILER: ${{ inputs.compiler }}
+        CACHE_CONTAINER_IMAGE: ${{ inputs.container-image }}
         CACHE_CXX: ${{ inputs.cxx }}
+        CACHE_GITHUB_SHA: ${{ github.sha }}
+        CACHE_RUNNER_ARCH: ${{ runner.arch }}
+        CACHE_RUNNER_OS: ${{ runner.os }}
         ROCKSDB_REVISION: ${{ inputs.rocksdb-revision }}
         NIMBLE_REVISION: ${{ inputs.nimble-revision }}
       run: |
         set -euo pipefail
+
+        # Bump the source schema whenever source-mutating patches, independently
+        # pinned FetchContent dependencies, or cached subbuild layout changes.
+        source_cache_schema="v2"
+        object_cache_schema="v2"
 
         resolve_remote_ref() {
           local repository="$1"
@@ -77,73 +102,96 @@ runs:
           printf '%s\n' "${sha}"
         }
 
+        fingerprint_executable() {
+          local executable="$1"
+          local executable_path
+
+          executable_path="$(readlink -f "$(command -v "${executable}")")"
+          sha256sum "${executable_path}" | cut -d' ' -f1
+        }
+
         rocksdb_commit="$(resolve_remote_ref facebook/rocksdb "${ROCKSDB_REVISION}")"
         nimble_commit="$(resolve_remote_ref facebookincubator/nimble "${NIMBLE_REVISION}")"
-        configuration_hash="$(
-          sha256sum \
-            CMakeLists.txt \
-            cmake/Dependencies.cmake \
-            nimble/CMakeLists.txt \
-            scripts/build-latest-releases.sh |
-            sha256sum |
-            cut -d' ' -f1
-        )"
-        dependency_hash="$(
+        cc_content_hash="$(fingerprint_executable "${CACHE_CC}")"
+        cxx_content_hash="$(fingerprint_executable "${CACHE_CXX}")"
+        cmake_content_hash="$(fingerprint_executable cmake)"
+        cc_version="$("${CACHE_CC}" --version | sed -n '1p')"
+        cxx_version="$("${CACHE_CXX}" --version | sed -n '1p')"
+        ccache_version="$(ccache --version | sed -n '1p')"
+        cmake_version="$(cmake --version | sed -n '1p')"
+        source_environment_fingerprint="$(
           printf '%s\n' \
-            "rocksdb=${rocksdb_commit}" \
-            "nimble=${nimble_commit}" \
-            "configuration=${configuration_hash}" |
+            "container-image=${CACHE_CONTAINER_IMAGE}" \
+            "cmake-content=${cmake_content_hash}" |
             sha256sum |
             cut -d' ' -f1
         )"
-        compiler_version="$("${CACHE_CXX}" --version | head -n 1)"
-        object_hash="$(
+        toolchain_fingerprint="$(
           printf '%s\n' \
-            "dependencies=${dependency_hash}" \
-            "compiler-version=${compiler_version}" \
-            "build-type=${CMAKE_BUILD_TYPE:-RelWithDebInfo}" \
-            "cxx-flags=${CMAKE_CXX_FLAGS:-}" \
-            "cxx-extensions=${CMAKE_CXX_EXTENSIONS:-ON}" \
-            "force-gnu-cxx20=${FORCE_GNU_CXX20:-ON}" \
-            "disable-liburing=${FOLLY_FORCE_DISABLE_LIBURING:-ON}" \
-            "force-sse42=${FORCE_X86_SSE42:-ON}" \
-            "gflags-target-namespace=${GFLAGS_USE_TARGET_NAMESPACE:-OFF}" |
+            "container-image=${CACHE_CONTAINER_IMAGE}" \
+            "cc-content=${cc_content_hash}" \
+            "cxx-content=${cxx_content_hash}" \
+            "ccache-version=${ccache_version}" |
             sha256sum |
             cut -d' ' -f1
         )"
+        source_key="dependency-sources-${source_cache_schema}-${CACHE_RUNNER_OS}-${CACHE_RUNNER_ARCH}-${source_environment_fingerprint}-${rocksdb_commit}-${nimble_commit}"
+        object_prefix="dependency-objects-${object_cache_schema}-${CACHE_RUNNER_OS}-${CACHE_RUNNER_ARCH}-${toolchain_fingerprint}-${CACHE_COMPILER}-${rocksdb_commit}-${nimble_commit}-"
+        object_key="${object_prefix}${CACHE_GITHUB_SHA}"
 
-        echo "dependency-hash=${dependency_hash}" >> "${GITHUB_OUTPUT}"
-        echo "object-hash=${object_hash}" >> "${GITHUB_OUTPUT}"
+        {
+          echo "source-key=${source_key}"
+          echo "object-key=${object_key}"
+          echo "object-prefix=${object_prefix}"
+        } >> "${GITHUB_OUTPUT}"
+        echo "Cache schemas:        source=${source_cache_schema}, objects=${object_cache_schema}"
+        echo "Cache scope:          ref=${GITHUB_REF}, event=${GITHUB_EVENT_NAME}, sha=${CACHE_GITHUB_SHA}"
+        echo "Container image:      ${CACHE_CONTAINER_IMAGE}"
+        echo "Source environment:   ${source_environment_fingerprint}"
+        echo "Toolchain fingerprint: ${toolchain_fingerprint}"
         echo "RocksDB cache commit: ${rocksdb_commit}"
         echo "Nimble cache commit:  ${nimble_commit}"
-        echo "Compiler identity:    ${compiler_version}"
+        echo "C compiler identity:  ${cc_version}"
+        echo "C compiler content:   ${cc_content_hash}"
+        echo "C++ compiler identity: ${cxx_version}"
+        echo "C++ compiler content: ${cxx_content_hash}"
+        echo "Ccache identity:      ${ccache_version}"
+        echo "CMake identity:       ${cmake_version}"
+        echo "CMake content:        ${cmake_content_hash}"
+        echo "Source cache key:     ${source_key}"
+        echo "Object cache key:     ${object_key}"
+        echo "Object restore prefix: ${object_prefix}"
 
     - name: Set compiler cache environment
       shell: bash
       run: |
-        echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache" >> "${GITHUB_ENV}"
-        echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
-        echo "CCACHE_NOHASHDIR=true" >> "${GITHUB_ENV}"
-        echo "CCACHE_COMPILERCHECK=content" >> "${GITHUB_ENV}"
-        # Two compiler-specific caches plus the source cache must share the
-        # repository's cache quota.
-        echo "CCACHE_MAXSIZE=4G" >> "${GITHUB_ENV}"
+        {
+          echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache"
+          echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+          echo "CCACHE_NOHASHDIR=true"
+          echo "CCACHE_COMPILERCHECK=content"
+          # Compiler-cache generations and the source cache share the
+          # repository's cache quota.
+          echo "CCACHE_MAXSIZE=4G"
+        } >> "${GITHUB_ENV}"
 
     - name: Cache FetchContent sources
+      id: source-cache
       uses: actions/cache@v4
       with:
         path: |
           ${{ github.workspace }}/build-latest-releases/_deps/*-src
           ${{ github.workspace }}/build-latest-releases/_deps/*-subbuild
-        key: dependency-sources-${{ runner.os }}-${{ runner.arch }}-${{ github.job_container.image }}-${{ steps.cache-key.outputs.dependency-hash }}
+        key: ${{ steps.cache-key.outputs.source-key }}
 
     - name: Cache compiled dependency objects
+      id: object-cache
       uses: actions/cache@v4
       with:
         path: ${{ github.workspace }}/.ccache
-        key: dependency-objects-${{ runner.os }}-${{ runner.arch }}-${{ github.job_container.image }}-${{ inputs.compiler }}-${{ steps.cache-key.outputs.object-hash }}-${{ github.sha }}
+        key: ${{ steps.cache-key.outputs.object-key }}
         restore-keys: |
-          dependency-objects-${{ runner.os }}-${{ runner.arch }}-${{ github.job_container.image }}-${{ inputs.compiler }}-${{ steps.cache-key.outputs.object-hash }}-
+          ${{ steps.cache-key.outputs.object-prefix }}
 
     - name: Initialize compiler cache
       shell: bash
@@ -151,4 +199,7 @@ runs:
         command -v ccache >/dev/null
         mkdir -p "${CCACHE_DIR}"
         ccache --max-size "${CCACHE_MAXSIZE}"
+        ccache --show-config
+        ccache --show-stats -v
+        du -sh "${CCACHE_DIR}" || true
         ccache --zero-stats

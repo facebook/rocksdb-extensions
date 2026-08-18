@@ -17,15 +17,13 @@ jobs:
     runs-on:
       labels: 32-core-ubuntu
     container:
-      image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
+      image: ${{ matrix.container_image }}
     timeout-minutes: 120
     env:
       # Older devvm-built images contain a loopback proxy that is unreachable
       # from GitHub-hosted job containers.
       http_proxy: ""
       https_proxy: ""
-      ROCKSDB_REVISION: v11.8.0
-      NIMBLE_REVISION: acead744054eb006da753390ba80d3b6a29212ce
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
       # Preserve restored FetchContent sources and skip update checks for the
@@ -39,22 +37,26 @@ jobs:
           - compiler: gcc
             cc: gcc
             cxx: g++
+            container_image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
           - compiler: clang
             cc: clang
             cxx: clang++
+            container_image: ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Resolve dependency revisions
         id: revisions
-        run: ./scripts/build-latest-releases.sh --resolve-only >> "${GITHUB_OUTPUT}"
+        run: ./scripts/build-latest-releases.sh --locked --resolve-only >> "${GITHUB_OUTPUT}"
 
       - name: Restore dependency caches
         uses: ./.github/actions/setup-dependency-cache
         with:
           compiler: ${{ matrix.compiler }}
+          cc: ${{ matrix.cc }}
           cxx: ${{ matrix.cxx }}
+          container-image: ${{ matrix.container_image }}
           rocksdb-revision: ${{ steps.revisions.outputs.rocksdb_revision }}
           nimble-revision: ${{ steps.revisions.outputs.nimble_revision }}
 
@@ -66,4 +68,4 @@ jobs:
 
       - name: Report compiler cache statistics
         if: always()
-        run: ccache --show-stats || true
+        run: ccache --show-stats -v || true
