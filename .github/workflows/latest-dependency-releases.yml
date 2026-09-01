@@ -27,6 +27,10 @@ concurrency:
   group: weekly-dependency-updates
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   resolve:
     name: Resolve dependency revisions
