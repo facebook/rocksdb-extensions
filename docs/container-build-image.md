@@ -89,7 +89,7 @@ Pass explicit revisions to test a different dependency pair:
 podman run --rm -it \
   -v "$PWD:/workspace/rocksdb-extensions:Z" \
   -w /workspace/rocksdb-extensions \
-  -e ROCKSDB_REVISION=v11.8.0 \
+  -e ROCKSDB_REVISION=v11.8.1 \
   -e NIMBLE_REVISION=<nimble-commit> \
   ghcr.io/facebook/rocksdb-extensions_ubuntu:24.0 \
   ./scripts/build-latest-releases.sh

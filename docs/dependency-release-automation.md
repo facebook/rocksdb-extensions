@@ -85,7 +85,7 @@ Test the latest upstream candidates:
 Test explicit revisions:
 
 ```bash
-ROCKSDB_REVISION=v11.8.0 \
+ROCKSDB_REVISION=v11.8.1 \
 NIMBLE_REVISION=<nimble-commit> \
   ./scripts/build-latest-releases.sh
 ```
