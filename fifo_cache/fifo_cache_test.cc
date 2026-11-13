@@ -3271,6 +3271,56 @@ TEST_F(FIFOCacheTest, RefChangesCreditTheirSnapshotQueue) {
   expect_counters_match_walk();
   EXPECT_EQ(0, cache_->GetPinnedUsage());
 }
+
+// Retired slots come back while Lookups keep overlapping. Each round parks a
+// new Lookup before releasing the previous one, so some reader is announced
+// at every scan, and the round's inserts retire about 300 slots. A slot
+// retired in one round must be reusable in the next, which needs the epoch
+// to advance past the parked reader; otherwise every new reader announces
+// the epoch the retired batches carry and the table grows each round.
+TEST_F(FIFOCacheTest, RetiredSlotsReturnWhileLookupsOverlap) {
+  NewCache(/*capacity*/ 200);
+  InsertN("f", 200);
+  struct Park {
+    std::promise<void> reached;
+    std::promise<void> resume;
+  };
+  std::atomic<Park*> next{nullptr};
+  SyncPoint::GetInstance()->SetCallBack("FIFOCacheShard::Lookup:Found",
+                                        [&](void*) {
+                                          Park* p = next.exchange(nullptr);
+                                          if (p != nullptr) {
+                                            p->reached.set_value();
+                                            p->resume.get_future().wait();
+                                          }
+                                        });
+  SyncPoint::GetInstance()->EnableProcessing();
+  auto start_parked = [&](Park* p) {
+    next.store(p);
+    port::Thread t([this] { LookupBool("f0"); });
+    p->reached.get_future().wait();
+    return t;
+  };
+  auto parked = std::make_unique<Park>();
+  port::Thread reader = start_parked(parked.get());
+  for (int round = 0; round < 10; ++round) {
+    InsertN("r" + std::to_string(round) + "_", 300);
+    auto next_parked = std::make_unique<Park>();
+    port::Thread next_reader = start_parked(next_parked.get());
+    parked->resume.set_value();
+    reader.join();
+    reader = std::move(next_reader);
+    parked = std::move(next_parked);
+  }
+  parked->resume.set_value();
+  reader.join();
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  // 200 entries need 334 homes at the 3/5 load factor, and about one round
+  // of retired slots waiting for reclamation grows the table past that, to
+  // about 500: well under 1000 homes. Without reuse it reaches the 2048 cap.
+  EXPECT_LT(cache_->GetTableAddressCount(), size_t{1000});
+}
 #endif  // !NDEBUG
 
 // Q4: many threads mix Lookup, Release (some erasing), Insert with and

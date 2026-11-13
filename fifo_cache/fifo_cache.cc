@@ -1044,7 +1044,8 @@ void FIFOCacheShard::StampPending() {
 uint64_t FIFOCacheShard::OldestAnnouncedEpoch() const {
   // Pairs with the fence in Lookup: a Lookup whose announcement this scan
   // misses starts after everything unlinked before the fence, so it cannot
-  // reach it.
+  // reach it. The acquire load of an announcement pairs with its release
+  // store, which orders the reader's earlier reads before this scan.
   std::atomic_thread_fence(std::memory_order_seq_cst);
   uint64_t oldest = std::numeric_limits<uint64_t>::max();
   for (const ThreadReader* r = ThreadReaders().load(std::memory_order_acquire);
@@ -1426,8 +1427,12 @@ FIFOHandle* FIFOCacheShard::Lookup(const Slice& key, HashCref hash,
   bool temporary_reader = false;
   ThreadReader* reader = MyThreadReader(&temporary_reader);
   reader->shard.store(this, std::memory_order_relaxed);
+  // Release: a scan that reads this announcement must be ordered after the
+  // reads made under this reader's previous one. Those come after that
+  // announcement's fence, and the scan no longer sees its reset to 0, whose
+  // release sequence a later relaxed store would not extend.
   reader->epoch.store(epoch_.load(std::memory_order_acquire),
-                      std::memory_order_relaxed);
+                      std::memory_order_release);
   std::atomic_thread_fence(std::memory_order_seq_cst);
   FIFOHandle* e = FindInTable(key, hash);
   TEST_SYNC_POINT("FIFOCacheShard::Lookup:Found");
@@ -1683,8 +1688,9 @@ size_t FIFOCacheShard::GetPinnedUsage() const {
   bool temporary_reader = false;
   ThreadReader* reader = MyThreadReader(&temporary_reader);
   reader->shard.store(this, std::memory_order_relaxed);
+  // Release, as in Lookup.
   reader->epoch.store(epoch_.load(std::memory_order_acquire),
-                      std::memory_order_relaxed);
+                      std::memory_order_release);
   std::atomic_thread_fence(std::memory_order_seq_cst);
   const size_t used_length =
       LengthInfoToUsedLength(length_info_.load(std::memory_order_acquire));
