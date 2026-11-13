@@ -2734,6 +2734,49 @@ TEST_F(FIFOCacheTest, CreateFromStringRoundTripsScalarOptions) {
   }
 }
 
+// Left negative, num_shard_bits becomes as many bits as keep every shard at
+// 4 MiB or more, up to 6, from C++ options and from the option string
+// alike. An explicit value still wins.
+TEST_F(FIFOCacheTest, DefaultShardBitsKeepShardsAtLeast4MiB) {
+  constexpr size_t kMiB = size_t{1} << 20;
+  const struct {
+    size_t capacity;
+    int bits;
+  } cases[] = {
+      {1 * kMiB, 0},      {4 * kMiB - 1, 0},   {4 * kMiB, 0},
+      {8 * kMiB - 1, 0},  {8 * kMiB, 1},       {16 * kMiB - 1, 1},
+      {16 * kMiB, 2},     {32 * kMiB - 1, 2},  {32 * kMiB, 3},
+      {64 * kMiB - 1, 3}, {64 * kMiB, 4},      {128 * kMiB - 1, 4},
+      {128 * kMiB, 5},    {256 * kMiB - 1, 5}, {256 * kMiB, 6},
+      {4096 * kMiB, 6},
+  };
+  ConfigOptions config_options;
+  for (const auto& c : cases) {
+    FIFOCacheOptions opts;
+    opts.capacity = c.capacity;
+    std::shared_ptr<Cache> built = opts.MakeSharedCache();
+    ASSERT_NE(nullptr, built);
+    EXPECT_EQ(c.bits, static_cast<FIFOCache*>(built.get())->GetNumShardBits())
+        << c.capacity;
+    std::shared_ptr<Cache> parsed;
+    ASSERT_OK(Cache::CreateFromString(
+        config_options, "fifo_cache://capacity=" + std::to_string(c.capacity),
+        &parsed));
+    ASSERT_NE(nullptr, parsed);
+    EXPECT_EQ(c.bits, static_cast<FIFOCache*>(parsed.get())->GetNumShardBits())
+        << c.capacity;
+  }
+  FIFOCacheOptions opts;
+  opts.capacity = 21 * kMiB;
+  opts.num_shard_bits = 5;
+  std::shared_ptr<Cache> built = opts.MakeSharedCache();
+  EXPECT_EQ(5, static_cast<FIFOCache*>(built.get())->GetNumShardBits());
+  std::shared_ptr<Cache> parsed;
+  ASSERT_OK(Cache::CreateFromString(
+      config_options, "fifo_cache://capacity=21M;num_shard_bits=5", &parsed));
+  EXPECT_EQ(5, static_cast<FIFOCache*>(parsed.get())->GetNumShardBits());
+}
+
 // Spaces inside the braces are trimmed as in the LRU form, so a fifo_cache://
 // value written that way builds a FIFOCache instead of falling through to the
 // object registry, which returns OK and leaves the caller's cache unchanged.

@@ -54,11 +54,16 @@ namespace ROCKSDB_NAMESPACE {
 //
 // Choosing num_shard_bits: hits take no lock, so more shards only spread
 // inserts (misses) over more locks, while fewer, larger shards share space
-// more evenly. In db_bench and cache_bench runs, the default (up to 64
-// shards) was best or tied from 256 MiB up; fewer shards were faster only
-// for a cache much smaller than its hot set, and very small shards were
-// slower. So keep the default unless the cache is much smaller than its hot
-// set.
+// more evenly. Left negative, it keeps every shard at 4 MiB or more, up to 64
+// shards from 256 MiB. In db_bench runs, 512 KiB shards lost space to blocks
+// much larger than average, such as unpartitioned index and filter blocks,
+// and missed up to 2.4 times as often as 4 MiB shards at 7 to 62 MiB, while
+// one or two shards behind 16 threads spent 28% to 92% more CPU than 32 or
+// 64 shards on the same misses. In db_bench and cache_bench runs, 64 shards
+// were best or tied from 256 MiB up. Below 256 MiB, many threads inserting
+// into a cache whose misses are cheap can get more throughput from more
+// shards: cache_bench at 16 and 64 MiB did 9% to 45% fewer ops/sec with the
+// default's 4 or 16 shards than with 32 or 64. Otherwise keep the default.
 //
 // This is an opt-in implementation and not the default block cache. Besides
 // MakeSharedCache, a RocksDB built with this plugin creates one from

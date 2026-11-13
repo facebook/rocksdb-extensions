@@ -1837,7 +1837,7 @@ std::shared_ptr<Cache> FIFOCacheOptions::MakeSharedCache() const {
   // For sanitized options
   FIFOCacheOptions opts = *this;
   if (opts.num_shard_bits < 0) {
-    opts.num_shard_bits = GetDefaultCacheShardBits(capacity);
+    opts.num_shard_bits = FIFOCache::DefaultShardBits(capacity);
   }
   std::shared_ptr<Cache> cache = std::make_shared<FIFOCache>(opts);
   if (secondary_cache) {

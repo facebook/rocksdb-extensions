@@ -122,10 +122,11 @@ a string:
   ```
 
 The string options are `capacity` (required, non-zero), `num_shard_bits`
-(below 20; by default chosen from the capacity), `strict_capacity_limit`,
-`metadata_charge_policy` (`kFullChargeCacheMetadata` or
-`kDontChargeCacheMetadata`), `hash_seed`, `use_adaptive_mutex` and
-`max_capacity`. A bad or unknown option fails with `InvalidArgument`.
+(below 20; by default as many as keep each shard at 4 MiB or more, up to 6),
+`strict_capacity_limit`, `metadata_charge_policy`
+(`kFullChargeCacheMetadata` or `kDontChargeCacheMetadata`), `hash_seed`,
+`use_adaptive_mutex` and `max_capacity`. A bad or unknown option fails with
+`InvalidArgument`.
 
 ### From C++
 

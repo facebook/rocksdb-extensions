@@ -44,7 +44,8 @@ Cache* NewFIFOCacheFromUri(const std::string& uri,
   // FIFOCacheOptions::MakeSharedCache without a secondary cache, which the
   // string form cannot set; the registry needs a uniquely owned object.
   if (cache_opts.num_shard_bits < 0) {
-    cache_opts.num_shard_bits = GetDefaultCacheShardBits(cache_opts.capacity);
+    cache_opts.num_shard_bits =
+        FIFOCache::DefaultShardBits(cache_opts.capacity);
   }
   guard->reset(new FIFOCache(cache_opts));
   return guard->get();

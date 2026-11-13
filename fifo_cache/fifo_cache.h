@@ -900,6 +900,16 @@ class FIFOCache
  public:
   explicit FIFOCache(const FIFOCacheOptions& opts);
   const char* Name() const override { return "FIFOCache"; }
+
+  // The num_shard_bits used when it is left negative: as many as keep every
+  // shard at kMinShardSize or more, up to 6. In smaller shards a block much
+  // larger than average, such as an index or filter block, takes a big share
+  // of its shard. Fewer, larger shards put more inserts behind each shard
+  // mutex.
+  static constexpr size_t kMinShardSize = size_t{4} << 20;
+  static int DefaultShardBits(size_t capacity) {
+    return GetDefaultCacheShardBits(capacity, kMinShardSize);
+  }
   ObjectPtr Value(Handle* handle) override;
   size_t GetCharge(Handle* handle) const override;
   const CacheItemHelper* GetCacheItemHelper(Handle* handle) const override;
