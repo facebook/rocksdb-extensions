@@ -94,12 +94,20 @@ struct FIFOHandle : public Cache::Handle {
   // Queue links, as slot indices. Under the shard lock.
   uint32_t next = 0;
   uint32_t prev = 0;
-  // Saturating access counter, range 0..kMaxFrequency. Incremented by Lookup
-  // only (never by Ref); promotion and second-chance decisions read it at
-  // eviction time. Reset to 0 on promotion to resident. Lock-free hits and
-  // the locked clock may race on it; a lost update only shifts one
-  // decision.
+  // The low bits (kFreqCountMask) are a saturating access counter, range
+  // 0..kMaxFrequency, incremented by Lookup only (never by Ref); promotion
+  // and second-chance decisions read it at eviction time. Lookup's store
+  // also sets kFreqHit. Entering the resident queue resets the whole byte,
+  // to kFreqFastTracked for a ghost return inserted there and to 0 for a
+  // promotion, so an entry the clock evicts without kFreqHit had no hit
+  // since, and kFreqFastTracked says how it came in. A saturated counter
+  // skips the store, but a resident entry only gets there through hits
+  // that set kFreqHit. Lock-free hits and the locked clock may race on the
+  // byte; a lost update only shifts one decision, or one count.
   std::atomic<uint8_t> freq{0};
+  static constexpr uint8_t kFreqCountMask = 0x3;
+  static constexpr uint8_t kFreqHit = 1 << 6;
+  static constexpr uint8_t kFreqFastTracked = 1 << 7;
   uint8_t flags = 0;
   enum Flags : uint8_t {
     // The slot holds an entry, or one retired and not yet reclaimed.
@@ -319,6 +327,10 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // remembers. Not threadsafe beyond the shard lock taken inside.
   size_t TEST_GetGhostSize() const;
 
+  // This shard's FIFOCacheRoleCounts, indexed by CacheEntryRole. Takes
+  // mutex_.
+  std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles> GetRoleCounts() const;
+
   // Probation list only; resident entries are not visible here. Walk it
   // with TEST_Next.
   void TEST_GetFIFOList(FIFOHandle** fifo);
@@ -488,6 +500,8 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // promoted, below it is evicted.
   static constexpr uint8_t kMaxFrequency = 3;
   static constexpr uint8_t kPromoteThreshold = 2;
+  static_assert(kMaxFrequency <= FIFOHandle::kFreqCountMask,
+                "the counter must fit below the freq flag bits");
   // Resident second-chance bound: each eviction costs at most this many
   // passes over resident (3 to drain a saturated counter, 1 to reap). That
   // many consecutive eviction-free passes mean every remaining entry is
@@ -857,6 +871,13 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // into ghost_index_ survived its eviction.
   uint64_t ghost_records_;
 
+  // GetRoleCounts' counts, by the role of each entry's helper. Under mutex_:
+  // every decision they count is made with it held.
+  std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles> role_counts_{};
+  FIFOCacheRoleCounts& RoleCountsOf(const Cache::CacheItemHelper* helper) {
+    return role_counts_[static_cast<uint32_t>(helper->role)];
+  }
+
   // We don't count mutex_ as the cache's internal state so semantically we
   // don't mind mutex_ invoking the non-const actions.
   mutable DMutex mutex_;
@@ -912,6 +933,16 @@ class FIFOCache
 
   // Retrieves number of elements in FIFO, for unit test purpose only.
   size_t TEST_GetFIFOSize();
+
+  // The shards' role counts summed, as GetFIFOCacheRoleCounts returns them.
+  std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles> GetRoleCounts() const;
+
+  // GetOptionsPtr(kSelfName) returns this FIFOCache. The adapter
+  // MakeSharedCache wraps it in for a secondary cache reports the same
+  // Name() and forwards this one name, so GetFIFOCacheRoleCounts finds the
+  // FIFOCache behind either without RTTI and never casts anything else.
+  static constexpr const char* kSelfName = "FIFOCache";
+  const void* GetOptionsPtr(const std::string& name) const override;
 };
 
 }  // namespace fifo_cache

@@ -15,8 +15,10 @@ Eviction*](https://jasony.me/publication/sosp23-s3fifo.pdf) (SOSP '23):
 
 `Cache::Priority` is ignored: placement follows access frequency.
 [`fifo_cache_options.h`](fifo_cache_options.h) documents the options, memory
-accounting and how to choose `num_shard_bits`. The API is experimental and
-may change.
+accounting and how to choose `num_shard_bits`. `GetFIFOCacheRoleCounts`, in
+the same header, returns per-role counts of promotions, ghost returns and
+promotions that were never hit, for exporting as metrics. The API is
+experimental and may change.
 
 This directory is a [RocksDB
 plugin](https://github.com/facebook/rocksdb/blob/main/plugin/README.md): it is

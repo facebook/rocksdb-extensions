@@ -8,7 +8,9 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <utility>
 
@@ -97,5 +99,37 @@ struct FIFOCacheOptions : public ShardedCacheOptions {
   // Construct an instance of FIFOCache using these options
   std::shared_ptr<Cache> MakeSharedCache() const;
 };
+
+// Counts of FIFOCache's queue decisions for the entries of one
+// CacheEntryRole, since the cache was created. Ghost returns say promotion
+// is too strict for the role, wasted promotions and wasted fast-tracks that
+// entry to the resident queue is too lenient. Only the resident queue's own
+// evictions (including those a capacity cut makes) count as waste: an entry
+// erased, overwritten, removed by EraseUnRefEntries or dropped by its last
+// Release while the shard is over capacity is not counted either way.
+struct FIFOCacheRoleCounts {
+  // Probation entries moved to the resident queue at the probation head.
+  uint64_t promotions = 0;
+  // Inserts of a key recently evicted from probation and still remembered.
+  uint64_t ghost_returns = 0;
+  // Ghost returns inserted straight into the resident queue (today, every
+  // one).
+  uint64_t ghost_fast_tracks = 0;
+  // Promoted entries evicted from the resident queue with no hit since
+  // their promotion.
+  uint64_t wasted_promotions = 0;
+  // Fast-tracked entries evicted from the resident queue with no hit since
+  // their insert.
+  uint64_t wasted_fast_tracks = 0;
+};
+
+// Sets *counts, indexed by CacheEntryRole, to the counts of the FIFOCache
+// that cache is, or that MakeSharedCache wrapped for a secondary cache,
+// summed over its shards. Each shard is read under its own lock, so the sum
+// is not taken at one instant. Returns false and leaves *counts unchanged
+// for any other cache.
+bool GetFIFOCacheRoleCounts(
+    const Cache& cache,
+    std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles>* counts);
 
 }  // namespace ROCKSDB_NAMESPACE

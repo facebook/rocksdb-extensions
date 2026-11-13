@@ -809,8 +809,8 @@ bool FIFOCacheShard::EvictFromProbation(EvictionData* data,
     uint32_t s = cur->state.load(std::memory_order_relaxed);
     assert(s & FIFOHandle::kInCache);
     assert(s & FIFOHandle::kInProbation);
-    const bool promote =
-        cur->freq.load(std::memory_order_relaxed) >= kPromoteThreshold;
+    const bool promote = (cur->freq.load(std::memory_order_relaxed) &
+                          FIFOHandle::kFreqCountMask) >= kPromoteThreshold;
     if ((s & FIFOHandle::kRefMask) != 0 ||
         !cur->state.compare_exchange_strong(
             s, promote ? s & ~FIFOHandle::kInProbation : 0,
@@ -825,6 +825,7 @@ bool FIFOCacheShard::EvictFromProbation(EvictionData* data,
         FIFO_Remove(cur, /*in_probation=*/true);
         FIFO_Append(resident(), cur);
         cur->freq.store(0, std::memory_order_relaxed);
+        ++RoleCountsOf(cur->helper).promotions;
         promoted = true;
       } else {
         FIFO_Remove(cur, /*in_probation=*/true);
@@ -860,7 +861,10 @@ void FIFOCacheShard::EvictFromResident(EvictionData* data,
       FIFOHandle* head = resident_hand_;
       uint32_t s = head->state.load(std::memory_order_relaxed);
       const uint8_t freq = head->freq.load(std::memory_order_relaxed);
-      if ((s & FIFOHandle::kRefMask) == 0 && freq > 0) {
+      TEST_SYNC_POINT_CALLBACK("FIFOCacheShard::EvictFromResident:Read", head);
+      if ((s & FIFOHandle::kRefMask) == 0 &&
+          (freq & FIFOHandle::kFreqCountMask) > 0) {
+        // Keeps the flag bits.
         head->freq.store(freq - 1, std::memory_order_relaxed);
         resident_hand_ = ResidentNext(head);
       } else if ((s & FIFOHandle::kRefMask) != 0 ||
@@ -880,6 +884,16 @@ void FIFOCacheShard::EvictFromResident(EvictionData* data,
         }
       } else {
         assert(s == FIFOHandle::kInCache);
+        // Read again: a Lookup that pinned and released head after the
+        // first read had its freq store ordered before the release this
+        // CAS acquired, and no Lookup can pin it now.
+        const uint8_t last = head->freq.load(std::memory_order_relaxed);
+        if ((last & FIFOHandle::kFreqHit) == 0) {
+          FIFOCacheRoleCounts& counts = RoleCountsOf(head->helper);
+          ++((last & FIFOHandle::kFreqFastTracked) != 0
+                 ? counts.wasted_fast_tracks
+                 : counts.wasted_promotions);
+        }
         FIFO_Remove(head, /*in_probation=*/false);
         EvictClaimed(head, data, deleted);
         evicted_this_pass = true;
@@ -1349,7 +1363,13 @@ Status FIFOCacheShard::InsertItem(const Slice& key, HashCref hash,
         e->helper = helper;
         e->total_charge = total_charge;
         e->next = e->prev = kNoLink;
-        e->freq.store(0, std::memory_order_relaxed);
+        e->freq.store(to_resident ? FIFOHandle::kFreqFastTracked : 0,
+                      std::memory_order_relaxed);
+        if (to_resident) {
+          FIFOCacheRoleCounts& counts = RoleCountsOf(helper);
+          ++counts.ghost_returns;
+          ++counts.ghost_fast_tracks;
+        }
         // The final state, set before the chain publishes e to Lookup.
         // Release: GetPinnedUsage reads total_charge after an acquire load
         // of state, without the chain.
@@ -1454,10 +1474,11 @@ FIFOHandle* FIFOCacheShard::Lookup(const Slice& key, HashCref hash,
   if ((s & FIFOHandle::kRefMask) == 0 && (s & FIFOHandle::kInProbation) != 0) {
     CreditProbationPin(e->total_charge);
   }
-  // A hit only credits frequency; the entry stays where it is.
+  // A hit only credits frequency, in the same store that marks the entry
+  // hit; the entry stays where it is.
   const uint8_t freq = e->freq.load(std::memory_order_relaxed);
-  if (freq < kMaxFrequency) {
-    e->freq.store(freq + 1, std::memory_order_relaxed);
+  if ((freq & FIFOHandle::kFreqCountMask) < kMaxFrequency) {
+    e->freq.store((freq + 1) | FIFOHandle::kFreqHit, std::memory_order_relaxed);
   }
   return e;
 }
@@ -1794,6 +1815,35 @@ size_t FIFOCache::TEST_GetFIFOSize() {
       [](FIFOCacheShard& cs) { return cs.TEST_GetFIFOSize(); });
 }
 
+std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles>
+FIFOCacheShard::GetRoleCounts() const {
+  DMutexLock l(mutex_);
+  return role_counts_;
+}
+
+std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles> FIFOCache::GetRoleCounts()
+    const {
+  std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles> sum{};
+  ForEachShard([&sum](const FIFOCacheShard* shard) {
+    const auto counts = shard->GetRoleCounts();
+    for (uint32_t r = 0; r < kNumCacheEntryRoles; ++r) {
+      sum[r].promotions += counts[r].promotions;
+      sum[r].ghost_returns += counts[r].ghost_returns;
+      sum[r].ghost_fast_tracks += counts[r].ghost_fast_tracks;
+      sum[r].wasted_promotions += counts[r].wasted_promotions;
+      sum[r].wasted_fast_tracks += counts[r].wasted_fast_tracks;
+    }
+  });
+  return sum;
+}
+
+const void* FIFOCache::GetOptionsPtr(const std::string& name) const {
+  if (name == kSelfName) {
+    return this;
+  }
+  return ShardedCache::GetOptionsPtr(name);
+}
+
 }  // namespace fifo_cache
 
 const std::unordered_map<std::string, OptionTypeInfo>&
@@ -1830,6 +1880,35 @@ FIFOCacheOptionsTypeInfo() {
   return type_info;
 }
 
+bool GetFIFOCacheRoleCounts(
+    const Cache& cache,
+    std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles>* counts) {
+  const auto* fifo =
+      static_cast<const FIFOCache*>(cache.GetOptionsPtr(FIFOCache::kSelfName));
+  if (fifo == nullptr) {
+    return false;
+  }
+  *counts = fifo->GetRoleCounts();
+  return true;
+}
+
+namespace {
+// CacheWithSecondaryAdapter reports its target's Name(), so a FIFOCache
+// wrapped in it looks like a bare one. This adapter also forwards
+// FIFOCache's GetOptionsPtr entry, so GetFIFOCacheRoleCounts finds the
+// FIFOCache behind it.
+class FIFOCacheSecondaryAdapter : public CacheWithSecondaryAdapter {
+ public:
+  using CacheWithSecondaryAdapter::CacheWithSecondaryAdapter;
+  const void* GetOptionsPtr(const std::string& name) const override {
+    if (name == FIFOCache::kSelfName) {
+      return target_->GetOptionsPtr(name);
+    }
+    return CacheWithSecondaryAdapter::GetOptionsPtr(name);
+  }
+};
+}  // namespace
+
 std::shared_ptr<Cache> FIFOCacheOptions::MakeSharedCache() const {
   if (num_shard_bits >= 20) {
     return nullptr;  // The cache cannot be sharded into too many fine pieces.
@@ -1841,7 +1920,7 @@ std::shared_ptr<Cache> FIFOCacheOptions::MakeSharedCache() const {
   }
   std::shared_ptr<Cache> cache = std::make_shared<FIFOCache>(opts);
   if (secondary_cache) {
-    cache = std::make_shared<CacheWithSecondaryAdapter>(cache, secondary_cache);
+    cache = std::make_shared<FIFOCacheSecondaryAdapter>(cache, secondary_cache);
   }
   return cache;
 }

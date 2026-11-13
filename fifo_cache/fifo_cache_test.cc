@@ -4586,6 +4586,272 @@ TEST_F(FIFOCacheTest, ReaderScanIntervalGrowsWithReaders) {
 }
 #endif  // !NDEBUG
 
+// Role counts for a role-only helper: entries of every other role must
+// stay at zero.
+void ExpectOnlyRoles(
+    const std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles>& counts,
+    std::initializer_list<CacheEntryRole> roles) {
+  for (uint32_t r = 0; r < kNumCacheEntryRoles; ++r) {
+    bool listed = false;
+    for (CacheEntryRole role : roles) {
+      listed = listed || static_cast<uint32_t>(role) == r;
+    }
+    if (listed) {
+      continue;
+    }
+    SCOPED_TRACE(r);
+    EXPECT_EQ(0, counts[r].promotions);
+    EXPECT_EQ(0, counts[r].ghost_returns);
+    EXPECT_EQ(0, counts[r].ghost_fast_tracks);
+    EXPECT_EQ(0, counts[r].wasted_promotions);
+    EXPECT_EQ(0, counts[r].wasted_fast_tracks);
+  }
+}
+
+// A worked example of promotions and wasted promotions, by role. Capacity 4
+// leaves a probation budget of 0, so every eviction starts at the probation
+// head and reaches the resident clock only when probation is empty.
+TEST_F(FIFOCacheTest, RoleCountsCountPromotionsAndWastedPromotions) {
+  // Static: the fixture frees the entries after the test body returns.
+  static const Cache::CacheItemHelper data(CacheEntryRole::kDataBlock);
+  static const Cache::CacheItemHelper index(CacheEntryRole::kIndexBlock);
+  auto insert = [&](const std::string& key, const Cache::CacheItemHelper& h,
+                    size_t charge) {
+    return cache_->Insert(key, FIFOCacheShard::ComputeHash(key, 0), nullptr, &h,
+                          charge, nullptr, Cache::Priority::LOW);
+  };
+  NewCache(/*capacity*/ 4);
+  ASSERT_EQ(0, cache_->TEST_GetProbationBudget());
+  ASSERT_OK(insert("a", data, 1));
+  ASSERT_OK(insert("b", index, 1));
+  HitNTimes("a", 2);
+  HitNTimes("b", 2);
+  ASSERT_OK(insert("c", data, 1));
+  ASSERT_OK(insert("d", data, 1));
+  // Full: the probation pass promotes a and b, then evicts c. The clock's
+  // hand is on a, with b after it.
+  ASSERT_OK(insert("e", data, 1));
+  ASSERT_FALSE(ContainsForTest("c"));
+  ASSERT_FALSE(InProbationForTest("a"));
+  ASSERT_FALSE(InProbationForTest("b"));
+  // One hit for a in the resident queue.
+  HitNTimes("a", 1);
+  Erase("d");
+  Erase("e");
+  // Probation is empty, so the clock pays: the hand takes a's hit back and
+  // evicts b, which has had no hit since its promotion.
+  ASSERT_OK(insert("f", data, 3));
+  ASSERT_TRUE(ContainsForTest("a"));
+  ASSERT_FALSE(ContainsForTest("b"));
+  Erase("f");
+  // a is back at freq 0 but was hit after its promotion, so evicting it
+  // wastes nothing.
+  ASSERT_OK(insert("g", data, 4));
+  ASSERT_FALSE(ContainsForTest("a"));
+
+  const auto counts = cache_->GetRoleCounts();
+  const FIFOCacheRoleCounts& d =
+      counts[static_cast<uint32_t>(CacheEntryRole::kDataBlock)];
+  const FIFOCacheRoleCounts& i =
+      counts[static_cast<uint32_t>(CacheEntryRole::kIndexBlock)];
+  EXPECT_EQ(1, d.promotions);
+  EXPECT_EQ(0, d.wasted_promotions);
+  EXPECT_EQ(1, i.promotions);
+  EXPECT_EQ(1, i.wasted_promotions);
+  for (const FIFOCacheRoleCounts* c : {&d, &i}) {
+    EXPECT_EQ(0, c->ghost_returns);
+    EXPECT_EQ(0, c->ghost_fast_tracks);
+    EXPECT_EQ(0, c->wasted_fast_tracks);
+  }
+  ExpectOnlyRoles(counts,
+                  {CacheEntryRole::kDataBlock, CacheEntryRole::kIndexBlock});
+}
+
+// A worked example of ghost returns, fast-tracks and wasted fast-tracks.
+// Capacity 4 again, so probation pays for every insert while it holds
+// anything.
+TEST_F(FIFOCacheTest, RoleCountsCountGhostReturnsAndWastedFastTracks) {
+  // Static: the fixture frees the entries after the test body returns.
+  static const Cache::CacheItemHelper data(CacheEntryRole::kDataBlock);
+  static const Cache::CacheItemHelper index(CacheEntryRole::kIndexBlock);
+  auto insert = [&](const std::string& key, const Cache::CacheItemHelper& h,
+                    size_t charge) {
+    return cache_->Insert(key, FIFOCacheShard::ComputeHash(key, 0), nullptr, &h,
+                          charge, nullptr, Cache::Priority::LOW);
+  };
+  NewCache(/*capacity*/ 4);
+  for (const char* k : {"a", "b", "c", "d"}) {
+    ASSERT_OK(insert(k, data, 1));
+  }
+  // Evicts a from probation into the ghost.
+  ASSERT_OK(insert("e", data, 1));
+  ASSERT_FALSE(ContainsForTest("a"));
+  // a returns: the probation pass evicts b into the ghost and a goes
+  // straight to resident, where the hand sits on it.
+  ASSERT_OK(insert("a", data, 1));
+  ASSERT_FALSE(InProbationForTest("a"));
+  ASSERT_FALSE(ContainsForTest("b"));
+  // b returns the same way, evicting c, and goes in after a.
+  ASSERT_OK(insert("b", data, 1));
+  ASSERT_FALSE(InProbationForTest("b"));
+  ASSERT_FALSE(ContainsForTest("c"));
+  // One hit for b in the resident queue.
+  HitNTimes("b", 1);
+  Erase("d");
+  Erase("e");
+  // Probation is empty, so the clock pays: it evicts a, never hit since
+  // its fast-track.
+  ASSERT_OK(insert("x", index, 3));
+  ASSERT_FALSE(ContainsForTest("a"));
+  ASSERT_TRUE(ContainsForTest("b"));
+  Erase("x");
+  // The hand takes b's hit back on one lap and evicts it on the next: not
+  // a waste.
+  ASSERT_OK(insert("y", index, 4));
+  ASSERT_FALSE(ContainsForTest("b"));
+
+  const auto counts = cache_->GetRoleCounts();
+  const FIFOCacheRoleCounts& d =
+      counts[static_cast<uint32_t>(CacheEntryRole::kDataBlock)];
+  EXPECT_EQ(2, d.ghost_returns);
+  EXPECT_EQ(2, d.ghost_fast_tracks);
+  EXPECT_EQ(1, d.wasted_fast_tracks);
+  EXPECT_EQ(0, d.promotions);
+  EXPECT_EQ(0, d.wasted_promotions);
+  ExpectOnlyRoles(counts, {CacheEntryRole::kDataBlock});
+}
+
+#ifndef NDEBUG
+// A hit that lands after the clock reads an entry's freq and before it
+// claims the entry does not stop the eviction (the clock already read freq
+// 0), but it is a hit since promotion, so the eviction is not counted as
+// wasted.
+TEST_F(FIFOCacheTest, RoleCountsSeeAHitThatRacesTheClock) {
+  static const Cache::CacheItemHelper data(CacheEntryRole::kDataBlock);
+  auto insert = [&](const std::string& key, size_t charge) {
+    return cache_->Insert(key, FIFOCacheShard::ComputeHash(key, 0), nullptr,
+                          &data, charge, nullptr, Cache::Priority::LOW);
+  };
+  NewCache(/*capacity*/ 4);
+  ASSERT_OK(insert("a", 1));
+  HitNTimes("a", 2);
+  for (const char* k : {"b", "c", "d"}) {
+    ASSERT_OK(insert(k, 1));
+  }
+  // Promotes a and evicts b; then probation is emptied.
+  ASSERT_OK(insert("e", 1));
+  ASSERT_FALSE(InProbationForTest("a"));
+  for (const char* k : {"c", "d", "e"}) {
+    Erase(k);
+  }
+  bool hit = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FIFOCacheShard::EvictFromResident:Read", [&](void*) {
+        if (!hit) {
+          hit = true;
+          // Lookup takes no lock, and Release of a ref that is not the
+          // entry's last cached use takes none either.
+          EXPECT_TRUE(LookupBool("a"));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_OK(insert("x", 4));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_TRUE(hit);
+  EXPECT_FALSE(ContainsForTest("a"));
+  const auto counts = cache_->GetRoleCounts();
+  const FIFOCacheRoleCounts& d =
+      counts[static_cast<uint32_t>(CacheEntryRole::kDataBlock)];
+  EXPECT_EQ(1, d.promotions);
+  EXPECT_EQ(0, d.wasted_promotions);
+}
+#endif  // !NDEBUG
+
+// GetFIFOCacheRoleCounts reads the same totals from a FIFOCache that
+// MakeSharedCache wrapped for a secondary cache as from a bare one, and
+// returns false for any other cache.
+TEST_F(FIFOCacheTest, RoleCountsThroughSecondaryCacheAdapter) {
+  // Static: the fixture frees the entries after the test body returns.
+  static const Cache::CacheItemHelper data(CacheEntryRole::kDataBlock);
+  // Two promotions, as in RoleCountsCountPromotionsAndWastedPromotions.
+  auto run = [&](Cache& c) {
+    for (const char* k : {"a", "b"}) {
+      ASSERT_OK(c.Insert(k, nullptr, &data, 1));
+      for (int hit = 0; hit < 2; ++hit) {
+        Cache::Handle* h = c.Lookup(k);
+        ASSERT_NE(nullptr, h);
+        c.Release(h);
+      }
+    }
+    for (const char* k : {"c", "d", "e"}) {
+      ASSERT_OK(c.Insert(k, nullptr, &data, 1));
+    }
+  };
+  FIFOCacheOptions opts(/*capacity*/ 4, /*num_shard_bits*/ 0,
+                        /*strict_capacity_limit*/ false, nullptr,
+                        kDefaultToAdaptiveMutex, kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> bare = opts.MakeSharedCache();
+  opts.secondary_cache =
+      CompressedSecondaryCacheOptions(/*capacity*/ 1000, /*num_shard_bits*/ 0,
+                                      /*strict_capacity_limit*/ false, 0.5)
+          .MakeSharedSecondaryCache();
+  std::shared_ptr<Cache> wrapped = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, bare);
+  ASSERT_NE(nullptr, wrapped);
+  run(*bare);
+  run(*wrapped);
+
+  std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles> b{};
+  std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles> w{};
+  ASSERT_TRUE(GetFIFOCacheRoleCounts(*bare, &b));
+  ASSERT_TRUE(GetFIFOCacheRoleCounts(*wrapped, &w));
+  const uint32_t r = static_cast<uint32_t>(CacheEntryRole::kDataBlock);
+  EXPECT_EQ(2, b[r].promotions);
+  EXPECT_EQ(2, w[r].promotions);
+  ExpectOnlyRoles(b, {CacheEntryRole::kDataBlock});
+  ExpectOnlyRoles(w, {CacheEntryRole::kDataBlock});
+
+  std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles> untouched{};
+  untouched[r].promotions = 7;
+  EXPECT_FALSE(GetFIFOCacheRoleCounts(*NewLRUCache(1 << 20), &untouched));
+  HyperClockCacheOptions hcc(1 << 20, /*estimated_entry_charge*/ 0);
+  EXPECT_FALSE(GetFIFOCacheRoleCounts(*hcc.MakeSharedCache(), &untouched));
+  EXPECT_EQ(7, untouched[r].promotions);
+}
+
+// The cache-wide counts add up every shard's. 16 hot keys, each hit twice,
+// spread over 4 shards of capacity 16; then cold inserts overflow every
+// shard, so each shard's probation pass promotes its hot keys from the head
+// before evicting a cold one. The cold keys keep probation over its budget,
+// so the clock never runs and every hot key is promoted exactly once,
+// whichever shard it hashes to.
+TEST_F(FIFOCacheTest, RoleCountsSumOverShards) {
+  static const Cache::CacheItemHelper data(CacheEntryRole::kDataBlock);
+  FIFOCacheOptions opts(/*capacity*/ 64, /*num_shard_bits*/ 2,
+                        /*strict_capacity_limit*/ false, nullptr,
+                        kDefaultToAdaptiveMutex, kDontChargeCacheMetadata);
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  for (int i = 0; i < 16; ++i) {
+    const std::string k = "hot" + std::to_string(i);
+    ASSERT_OK(cache->Insert(k, nullptr, &data, 1));
+    for (int hit = 0; hit < 2; ++hit) {
+      Cache::Handle* h = cache->Lookup(k);
+      ASSERT_NE(nullptr, h);
+      cache->Release(h);
+    }
+  }
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_OK(cache->Insert("cold" + std::to_string(i), nullptr, &data, 1));
+  }
+  std::array<FIFOCacheRoleCounts, kNumCacheEntryRoles> counts{};
+  ASSERT_TRUE(GetFIFOCacheRoleCounts(*cache, &counts));
+  const uint32_t r = static_cast<uint32_t>(CacheEntryRole::kDataBlock);
+  EXPECT_EQ(16, counts[r].promotions);
+  EXPECT_EQ(0, counts[r].wasted_promotions);
+  EXPECT_EQ(0, counts[r].ghost_returns);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
