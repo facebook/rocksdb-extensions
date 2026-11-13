@@ -31,7 +31,6 @@
 #include "util/autovector.h"
 #include "util/distributed_mutex.h"
 #include "util/hash.h"
-#include "util/hash_containers.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace fifo_cache {
@@ -588,18 +587,42 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // The 32 bits of an entry's hash the ghost queue remembers.
   static uint32_t GhostHash(HashCref hash) { return Lower32of64(hash[0]); }
   // Records a probation victim's ghost hash and charge in the ghost queue,
-  // dropping the oldest ghosts beyond the bound. Call before removing the
-  // victim from the table so that a full shard of N entries keeps N ghosts.
+  // dropping the oldest ghosts beyond the bound, or nothing while the ring
+  // has no slots. Call before removing the victim from the table so that a
+  // full shard of N entries keeps N ghosts.
   void GhostRecord(uint32_t hash, size_t charge);
 
   // Forgets a ghost hash: drops it from the index, so its ring slot is skipped
   // when trimmed. Returns whether it was remembered.
   bool GhostTake(uint32_t hash);
   // Drops the oldest ghosts while the queue is over its bound. Called when a
-  // ghost is recorded and after SetCapacity, which can lower the bound.
-  // Erasing entries leaves the ghost as is: it adds no victims, and the
-  // ghost stays within the table's past size.
+  // ghost is recorded, after SetCapacity, which can lower the bound, and
+  // after EraseUnRefEntries. Other erases leave the ghost as is: they add
+  // no victims, and the ghost stays within the table's past size.
   void GhostTrim();
+  // Drops the oldest slot, and its index bucket if the slot is still the
+  // latest for its hash.
+  void GhostDropHead();
+  // The index bucket holding hash, or kNoGhost.
+  size_t GhostFind(uint32_t hash) const;
+  // Empties bucket b, moving later buckets of its probe run back so a probe
+  // never stops early at the hole.
+  void GhostEraseBucket(size_t b);
+  // Moves the ghost to a ring of length slots (0, or a power of two at least
+  // kMinGhostLength), which must hold every slot, and recharges its memory
+  // to usage_.
+  void GhostResize(size_t length);
+  // Ring length for n live entries: 0 for none, else n rounded up to a
+  // power of two, at least kMinGhostLength.
+  static size_t GhostLengthFor(size_t n);
+  // The ghost's memory charged to usage_: kGhostBytesPerSlot per ring slot
+  // under kFullChargeCacheMetadata, else 0.
+  size_t GhostMetaCharge() const;
+  size_t GhostMetaChargeFor(size_t length) const;
+  // Shrinks the ghost to what occupancy_ needs once it holds more than twice
+  // that, freeing it when the shard is empty. Called where GhostTrim is,
+  // after SetCapacity and EraseUnRefEntries, which then SyncOverCapacity.
+  void MaybeShrinkGhost();
 
   void NotifyEvicted(const autovector<FIFOHandle*>& evicted_handles);
 
@@ -819,42 +842,62 @@ class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
   // shard's worth of probation victims by charge, the unit of the budget,
   // so large victims cannot be remembered over many shards of traffic. The
   // slot bound keeps ghost memory proportional to the table it shadows
-  // even for tiny or zero charges. Not charged to usage_: about 8 bytes
-  // of ring plus one index entry per remembered key.
+  // even for tiny or zero charges.
+  // Memory: the ring has a slot for every live entry, rounded up to a power
+  // of two, and the index two 4-byte buckets per slot, so 16 bytes per slot
+  // (kGhostBytesPerSlot), charged to usage_ under kFullChargeCacheMetadata.
+  // Both grow together, only on an insert that would leave more live
+  // entries than ring slots and only when the growth fits under the same
+  // rules as a table growth step; a full ring drops its oldest slot to
+  // record a new one. So recording a ghost never allocates, and the memory
+  // tracks the table's peak size. A capacity cut or EraseUnRefEntries that
+  // leaves the ring more than twice what the remaining entries need
+  // shrinks it (MaybeShrinkGhost); other erases leave it, like the ghost
+  // it holds.
   // The bound is enforced when a ghost is recorded and after SetCapacity
-  // (GhostTrim). Erasing entries does not trim, so after erases ghost_size_
-  // can exceed occupancy_ until one of those runs.
+  // and EraseUnRefEntries (GhostTrim). Other erases do not trim, so after
+  // them ghost_size_ can exceed occupancy_ until one of those runs.
   // Placeholder inserts (zero charge, kNoopCacheItemHelper, as
   // CacheWithSecondaryAdapter uses to record recent use) neither take nor
   // leave a ghost, so readmission credit reaches the real entry.
-  // ghost_index_ maps a hash to the sequence number of its latest slot, so
-  // a stale slot (consumed by readmission, or superseded) is skipped when
-  // it reaches the head; stale slots still count toward the bound.
-  // Slots live in a power-of-two ring addressed by sequence number, so the
-  // ring allocates nothing once it has grown to the bound, and growing
-  // never moves a slot to another sequence number. ghost_index_ is
-  // allocation-free with folly (F14); std::unordered_map, used without
-  // USE_FOLLY, allocates a node per recorded ghost.
+  // The index maps a hash to the ring position of its latest slot, so a
+  // stale slot (consumed by readmission, or superseded) is skipped when it
+  // reaches the head; stale slots still count toward the bound. Slots live
+  // in a power-of-two ring addressed by sequence number, and every bucket
+  // names a slot between the head and the tail, so a ring position
+  // identifies its sequence number. The index is open addressing with
+  // linear probing at a load factor of at most 1/2, deleting by moving
+  // later buckets of the probe run back, so it needs no tombstones.
   struct GhostSlot {
     // Victim total_charge, saturated at UINT32_MAX; only the ghost bound
     // reads it.
     uint32_t charge;
     uint32_t hash;
   };
+  // The ring and the index both take kGhostBytesPerSlot per ring slot.
+  static constexpr size_t kGhostBytesPerSlot =
+      sizeof(GhostSlot) + 2 * sizeof(uint32_t);
+  static constexpr size_t kMinGhostLength = 16;
+  static constexpr size_t kNoGhost = std::numeric_limits<size_t>::max();
   std::unique_ptr<GhostSlot[]> ghost_ring_;
-  // Ring length, 0 or a power of two. Grows to the slot bound and never
-  // shrinks.
+  // Ring length, 0 (before the first insert, or while no growth has fit) or
+  // a power of two at least kMinGhostLength.
   size_t ghost_ring_length_;
+  // 2 * ghost_ring_length_ buckets, each 0 (empty) or 1 + the ring position
+  // of the latest slot for its hash; ghost_index_bits_ is their log2. The
+  // ring is at most the shard's peak occupancy_ rounded up, and max_length_
+  // keeps that within 2^31, so a position plus 1 fits.
+  std::unique_ptr<uint32_t[]> ghost_index_;
+  int ghost_index_bits_;
   // Sequence number of the oldest slot; slots are ghost_head_seq_ up to
   // ghost_head_seq_ + ghost_size_.
   uint64_t ghost_head_seq_;
   size_t ghost_size_;
-  using GhostIndex = UnorderedMap<uint32_t, uint64_t>;
-  GhostIndex ghost_index_;
   // Total charge of all slots in the ring, stale ones included.
   size_t ghost_charge_;
-  // Bumped by every GhostRecord, so InsertItem can tell whether an iterator
-  // into ghost_index_ survived its eviction.
+  // Bumped by every GhostRecord and GhostResize, the changes that can move
+  // buckets, so InsertItem can tell whether a bucket it found survived its
+  // eviction.
   uint64_t ghost_records_;
 
   // We don't count mutex_ as the cache's internal state so semantically we

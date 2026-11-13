@@ -534,6 +534,197 @@ TEST_F(FIFOCacheTest, CreateStandaloneUnchargedNotAllowed) {
   EXPECT_FALSE(cache_->Release(pinned, true, false));
 }
 
+// A 16-byte key, stored inline, so an entry's charge is exactly what it is
+// inserted with even under full metadata charging.
+std::string Key16(int i) {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%016d", i);
+  return std::string(buf, 16);
+}
+
+// Under full metadata charging the ghost counts toward usage: 16 bytes per
+// ghost slot, with a slot for every live entry, rounded up to a power of two
+// and at least 16. Without it, usage is just the entries.
+TEST_F(FIFOCacheTest, GhostMemoryCountsTowardUsage) {
+  for (CacheMetadataChargePolicy policy :
+       {kDontChargeCacheMetadata, kFullChargeCacheMetadata}) {
+    SCOPED_TRACE(policy);
+    NewCache(/*capacity*/ 1 << 20, /*strict*/ false, policy);
+    for (int i = 0; i < 100; ++i) {
+      ASSERT_OK(Insert(Key16(i), /*charge*/ 1000));
+    }
+    const bool full = policy == kFullChargeCacheMetadata;
+    const size_t table =
+        full ? cache_->GetTableAddressCount() * sizeof(FIFOHandle) : 0;
+    // 100 live entries: 128 slots.
+    const size_t ghost = full ? 128 * 16 : 0;
+    EXPECT_EQ(100 * 1000 + table + ghost, cache_->GetUsage());
+    // Filling the ghost leaves usage as it is: its ring was charged when it
+    // grew.
+    cache_->SetCapacity(cache_->GetUsage());
+    for (int i = 100; i < 200; ++i) {
+      ASSERT_OK(Insert(Key16(i), /*charge*/ 1000));
+    }
+    EXPECT_EQ(100, cache_->TEST_GetGhostSize());
+    ASSERT_EQ(table,
+              full ? cache_->GetTableAddressCount() * sizeof(FIFOHandle) : 0);
+    EXPECT_EQ(100 * 1000 + table + ghost, cache_->GetUsage());
+  }
+}
+
+// A capacity cut that leaves the ghost ring more than twice what the
+// remaining entries need gives back its memory.
+TEST_F(FIFOCacheTest, CapacityCutShrinksGhostMemory) {
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_OK(Insert(Key16(i), /*charge*/ 1000));
+  }
+  const size_t table = cache_->GetTableAddressCount() * sizeof(FIFOHandle);
+  // 60 entries need 64 slots: the 128-slot ring is within twice that and
+  // stays.
+  cache_->SetCapacity(60 * 1000 + table + 128 * 16);
+  EXPECT_EQ(60, cache_->GetOccupancyCount());
+  EXPECT_EQ(60 * 1000 + table + 128 * 16, cache_->GetUsage());
+  // Room for 10 entries beside the table and the 128-slot ring they are
+  // evicted under.
+  cache_->SetCapacity(10 * 1000 + table + 128 * 16);
+  EXPECT_EQ(10, cache_->GetOccupancyCount());
+  ASSERT_EQ(table, cache_->GetTableAddressCount() * sizeof(FIFOHandle));
+  // 10 live entries: 16 slots.
+  EXPECT_EQ(10 * 1000 + table + 16 * 16, cache_->GetUsage());
+  // Raising capacity changes nothing until new entries grow the ring again.
+  cache_->SetCapacity(1 << 20);
+  EXPECT_EQ(10 * 1000 + table + 16 * 16, cache_->GetUsage());
+  for (int i = 100; i < 150; ++i) {
+    ASSERT_OK(Insert(Key16(i), /*charge*/ 1000));
+  }
+  // 60 live entries: 64 slots.
+  ASSERT_EQ(60, cache_->GetOccupancyCount());
+  EXPECT_EQ(
+      60 * 1000 + cache_->GetTableAddressCount() * sizeof(FIFOHandle) + 64 * 16,
+      cache_->GetUsage());
+}
+
+// An overwrite keeps the number of entries, so it never grows the ring.
+TEST_F(FIFOCacheTest, OverwriteDoesNotGrowGhost) {
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_OK(Insert(Key16(i), /*charge*/ 1000));
+  }
+  const size_t usage = cache_->GetUsage();
+  ASSERT_EQ(Status::OkOverwritten(), Insert(Key16(0), /*charge*/ 1000));
+  EXPECT_EQ(usage, cache_->GetUsage());
+}
+
+// A ghost growth that does not fit evicts for it first, as a table growth
+// step does, so under strict_capacity_limit usage stays within capacity.
+TEST_F(FIFOCacheTest, GhostGrowthEvictsToFit) {
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ true, kFullChargeCacheMetadata);
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_OK(Insert(Key16(i), /*charge*/ 1000));
+  }
+  // Room for one more entry and a table growth step, not for doubling the
+  // 16-slot ring (256 more bytes).
+  const size_t capacity = cache_->GetUsage() + 1 + 2 * sizeof(FIFOHandle);
+  cache_->SetCapacity(capacity);
+  ASSERT_OK(Insert(Key16(16), /*charge*/ 1));
+  // The ring doubled after evicting the oldest entry.
+  EXPECT_EQ(16, cache_->GetOccupancyCount());
+  EXPECT_FALSE(ContainsForTest(Key16(0)));
+  const size_t table = cache_->GetTableAddressCount() * sizeof(FIFOHandle);
+  EXPECT_EQ(15 * 1000 + 1 + table + 32 * 16, cache_->GetUsage());
+  EXPECT_LE(cache_->GetUsage(), capacity);
+}
+
+// Under strict_capacity_limit, across every ring growth of a long
+// unique-key workload, usage stays within capacity and the ghost keeps a
+// key per entry.
+TEST_F(FIFOCacheTest, StrictLimitKeepsGhostWithinCapacity) {
+  const size_t capacity = 1 << 16;
+  NewCache(capacity, /*strict*/ true, kFullChargeCacheMetadata);
+  for (int i = 0; i < 2000; ++i) {
+    ASSERT_OK(Insert(Key16(i), /*charge*/ 100));
+    ASSERT_LE(cache_->GetUsage(), capacity) << i;
+  }
+  EXPECT_EQ(cache_->GetOccupancyCount(), cache_->TEST_GetGhostSize());
+}
+
+// A 16-byte key whose shard hash (ComputeHash with seed 0) is {h0, h1}.
+std::string KeyWithHash(uint64_t h0, uint64_t h1) {
+  uint64_t in[2];
+  BijectiveUnhash2x64(h1, h0, &in[1], &in[0]);
+  return std::string(reinterpret_cast<const char*>(in), 16);
+}
+
+// Two keys whose ghost hashes collide share one ghost record: recording the
+// second replaces the first, so only one of them returns to resident.
+TEST_F(FIFOCacheTest, GhostCollisionCreditsOnce) {
+  NewCache(/*capacity*/ 2);
+  const std::string x = KeyWithHash(0x1111111100000042ULL, 1);
+  const std::string y = KeyWithHash(0x2222222200000042ULL, 2);
+  ASSERT_NE(x, y);
+  ASSERT_OK(Insert(x));
+  ASSERT_OK(Insert(y));
+  // Evict x, then y, from probation. Ghost: [x, y], one record for both.
+  InsertN("k", 2);
+  ASSERT_FALSE(ContainsForTest(x));
+  ASSERT_FALSE(ContainsForTest(y));
+  cache_->SetCapacity(10);
+  // InProbationForTest cannot name 16-byte keys; ask the handle.
+  auto in_probation = [&](const std::string& key) {
+    FIFOHandle* h = Lookup(key);
+    EXPECT_NE(nullptr, h);
+    const bool probation = h != nullptr && h->InProbation();
+    cache_->Release(h, /*useful*/ true, /*erase_if_last_ref*/ false);
+    return probation;
+  };
+  ASSERT_OK(Insert(x));
+  EXPECT_FALSE(in_probation(x));
+  ASSERT_OK(Insert(y));
+  EXPECT_TRUE(in_probation(y));
+}
+
+// A shard with no room for the smallest ghost ring keeps no ghost: inserts
+// still work, and an evicted key comes back to probation.
+TEST_F(FIFOCacheTest, NoGhostWhenNoRingFits) {
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  // 16 slots of 16 bytes would not fit beside the empty table.
+  cache_->SetCapacity(cache_->GetUsage() + 200);
+  InsertN("k", 20);
+  EXPECT_EQ(0, cache_->TEST_GetGhostSize());
+  EXPECT_TRUE(ContainsForTest("k19"));
+  EXPECT_FALSE(ContainsForTest("k0"));
+  EXPECT_OK(Insert("k0"));
+  EXPECT_TRUE(InProbationForTest("k0"));
+}
+
+// A ring whose growth cannot fit stays full and drops its oldest key to
+// record a new one, so the ghost holds fewer keys than there are entries.
+TEST_F(FIFOCacheTest, FullGhostRingDropsOldest) {
+  NewCache(/*capacity*/ 1 << 20, /*strict*/ false, kFullChargeCacheMetadata);
+  std::vector<FIFOHandle*> pinned;
+  for (int i = 0; i < 16; ++i) {
+    FIFOHandle* h = nullptr;
+    ASSERT_OK(Insert("p" + std::to_string(i), /*charge*/ 1, &h));
+    pinned.push_back(h);
+  }
+  // Room for one more entry and its table growth, not for doubling the
+  // 16-slot ring (256 more bytes): every new entry evicts the previous one.
+  cache_->SetCapacity(cache_->GetUsage() + 2 * sizeof(FIFOHandle) + 1);
+  InsertN("u", 40);
+  EXPECT_EQ(17, cache_->GetOccupancyCount());
+  // Victims u0..u38; the ring keeps the newest 16, u23..u38.
+  EXPECT_EQ(16, cache_->TEST_GetGhostSize());
+  EXPECT_OK(Insert("u22"));
+  EXPECT_TRUE(InProbationForTest("u22"));
+  EXPECT_OK(Insert("u38"));
+  EXPECT_TRUE(ContainsForTest("u38"));
+  EXPECT_FALSE(InProbationForTest("u38"));
+  for (FIFOHandle* h : pinned) {
+    cache_->Release(h, /*useful*/ true, /*erase_if_last_ref*/ false);
+  }
+}
+
 // R3: metadata charging adds overhead but preserves logical charge.
 TEST_F(FIFOCacheTest, FullMetadataCharge) {
   NewCache(/*capacity*/ 100000, /*strict*/ false, kFullChargeCacheMetadata);
@@ -542,9 +733,10 @@ TEST_F(FIFOCacheTest, FullMetadataCharge) {
   ASSERT_NE(nullptr, h);
   EXPECT_EQ(1, h->GetCharge(kFullChargeCacheMetadata));
   EXPECT_GT(cache_->GetUsage(), 1);
+  // The ghost ring for one live entry: 16 slots of 16 bytes.
   EXPECT_EQ(cache_->GetUsage(),
             cache_->GetPinnedUsage() +
-                cache_->GetTableAddressCount() * sizeof(FIFOHandle));
+                cache_->GetTableAddressCount() * sizeof(FIFOHandle) + 16 * 16);
   EXPECT_FALSE(cache_->Release(h, true, false));
   EXPECT_EQ(0, cache_->GetPinnedUsage());
   EXPECT_GT(cache_->GetUsage(), 1);
@@ -2301,6 +2493,67 @@ TEST_F(FIFOCacheTest, GhostStaleSlotKeepsNewerRecord) {
   EXPECT_OK(Insert("a"));
   EXPECT_TRUE(ContainsForTest("a"));
   EXPECT_FALSE(InProbationForTest("a"));
+}
+
+// The ghost keeps its keys when its ring doubles: keys evicted before the
+// shard grew past the ring, including ones stored across the end of the
+// ring, still land in resident afterwards, and a key the bound dropped
+// does not.
+TEST_F(FIFOCacheTest, GhostHitsSurviveRingGrowth) {
+  NewCache(/*capacity*/ 80);
+  for (int i = 0; i < 8; i++) {
+    ASSERT_OK(Insert("a" + std::to_string(i), /*charge*/ 10));
+  }
+  // Evicts a0..a7 and b0..b11. The ghost keeps the last 8 victims, b4..b11,
+  // in slots 12..15 and 0..3 of the 16-slot ring.
+  for (int i = 0; i < 20; i++) {
+    ASSERT_OK(Insert("b" + std::to_string(i), /*charge*/ 10));
+  }
+  ASSERT_EQ(8, cache_->TEST_GetGhostSize());
+  // 20 more entries, with no eviction, take the shard past 16 entries.
+  cache_->SetCapacity(1000);
+  InsertN("e", 20);
+  ASSERT_EQ(28, cache_->GetOccupancyCount());
+  EXPECT_EQ(8, cache_->TEST_GetGhostSize());
+  // These take the shard past 32 entries, doubling the ring again.
+  for (int i = 4; i < 12; i++) {
+    const std::string key = "b" + std::to_string(i);
+    ASSERT_OK(Insert(key, /*charge*/ 10));
+    EXPECT_TRUE(ContainsForTest(key)) << key;
+    EXPECT_FALSE(InProbationForTest(key)) << key;
+  }
+  EXPECT_OK(Insert("b3", /*charge*/ 10));
+  EXPECT_TRUE(InProbationForTest("b3"));
+  // Each readmission used up its key's ghost record, including b8's, whose
+  // insert doubled the ring: inserted again, they go to probation.
+  for (int i = 4; i < 12; i++) {
+    const std::string key = "b" + std::to_string(i);
+    Erase(key);
+    ASSERT_OK(Insert(key, /*charge*/ 10));
+    EXPECT_TRUE(InProbationForTest(key)) << key;
+  }
+}
+
+// A capacity cut shrinks the ring and keeps the newest ghosts in it.
+TEST_F(FIFOCacheTest, GhostHitsSurviveRingShrink) {
+  NewCache(/*capacity*/ 100);
+  InsertN("k", 100);
+  // Evicts k0..k99 into a 128-slot ring.
+  InsertN("j", 100);
+  // Evicts j0..j89. The ghost keeps the last 10 victims, j80..j89, and the
+  // ring shrinks to 16 slots.
+  cache_->SetCapacity(10);
+  ASSERT_EQ(10, cache_->GetOccupancyCount());
+  ASSERT_EQ(10, cache_->TEST_GetGhostSize());
+  cache_->SetCapacity(100);
+  for (int i = 80; i < 90; i++) {
+    const std::string key = "j" + std::to_string(i);
+    ASSERT_OK(Insert(key));
+    EXPECT_TRUE(ContainsForTest(key)) << key;
+    EXPECT_FALSE(InProbationForTest(key)) << key;
+  }
+  EXPECT_OK(Insert("j79"));
+  EXPECT_TRUE(InProbationForTest("j79"));
 }
 
 // R4: under a long unique-key workload the ghost queue holds exactly as

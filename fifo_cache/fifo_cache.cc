@@ -358,6 +358,7 @@ FIFOCacheShard::FIFOCacheShard(size_t capacity, bool strict_capacity_limit,
       aside_slot_(SlotIndexAt(max_length_)),
       aside_unpinned_(false),
       ghost_ring_length_(0),
+      ghost_index_bits_(0),
       ghost_head_seq_(0),
       ghost_size_(0),
       ghost_charge_(0),
@@ -452,6 +453,10 @@ void FIFOCacheShard::EraseUnRefEntries() {
         cur = next;
       }
     }
+    // Only pinned entries are left: the ghost keeps as many keys and gives
+    // back the ring the others needed.
+    GhostTrim();
+    MaybeShrinkGhost();
     SyncOverCapacity();
   }
 
@@ -895,26 +900,38 @@ void FIFOCacheShard::EvictFromResident(EvictionData* data,
   }
 }
 
+namespace {
+// Home bucket of a ghost hash in an index of 2^bits buckets: its low bits,
+// which are as well mixed as any (the ghost hash is half the key's hash).
+inline size_t GhostHome(uint32_t hash, int bits) {
+  return hash & ((size_t{1} << bits) - 1);
+}
+}  // namespace
+
 void FIFOCacheShard::GhostRecord(uint32_t hash, size_t charge) {
+  if (ghost_ring_length_ == 0) {
+    // No growth has fit yet, so there is nowhere to remember the key.
+    return;
+  }
   ++ghost_records_;
   if (ghost_size_ == ghost_ring_length_) {
-    // Double the ring, keeping each slot at its sequence number.
-    const size_t new_length =
-        ghost_ring_length_ == 0 ? size_t{16} : ghost_ring_length_ * 2;
-    std::unique_ptr<GhostSlot[]> new_ring(new GhostSlot[new_length]);
-    for (uint64_t seq = ghost_head_seq_; seq < ghost_head_seq_ + ghost_size_;
-         ++seq) {
-      new_ring[seq & (new_length - 1)] =
-          ghost_ring_[seq & (ghost_ring_length_ - 1)];
-    }
-    ghost_ring_ = std::move(new_ring);
-    ghost_ring_length_ = new_length;
+    GhostDropHead();
   }
   const uint64_t seq = ghost_head_seq_ + ghost_size_;
-  ghost_index_[hash] = seq;
+  const size_t pos = seq & (ghost_ring_length_ - 1);
   const uint32_t slot_charge = static_cast<uint32_t>(
       std::min<size_t>(charge, std::numeric_limits<uint32_t>::max()));
-  ghost_ring_[seq & (ghost_ring_length_ - 1)] = GhostSlot{slot_charge, hash};
+  // pos is past the tail, so no bucket names it yet.
+  ghost_ring_[pos] = GhostSlot{slot_charge, hash};
+  const size_t mask = 2 * ghost_ring_length_ - 1;
+  size_t b = GhostHome(hash, ghost_index_bits_);
+  while (ghost_index_[b] != 0 &&
+         ghost_ring_[ghost_index_[b] - 1].hash != hash) {
+    b = (b + 1) & mask;
+  }
+  // A new hash takes the empty bucket; a remembered one now names its
+  // latest slot, leaving the older slot stale.
+  ghost_index_[b] = static_cast<uint32_t>(pos + 1);
   ++ghost_size_;
   ghost_charge_ += slot_charge;
   GhostTrim();
@@ -922,20 +939,138 @@ void FIFOCacheShard::GhostRecord(uint32_t hash, size_t charge) {
 
 void FIFOCacheShard::GhostTrim() {
   while (ghost_size_ > occupancy_ || ghost_charge_ > capacity_.Get()) {
-    const GhostSlot& head =
-        ghost_ring_[ghost_head_seq_ & (ghost_ring_length_ - 1)];
-    GhostIndex::iterator it = ghost_index_.find(head.hash);
-    if (it != ghost_index_.end() && it->second == ghost_head_seq_) {
-      ghost_index_.erase(it);
-    }
-    ghost_charge_ -= head.charge;
-    --ghost_size_;
-    ++ghost_head_seq_;
+    GhostDropHead();
   }
 }
 
+void FIFOCacheShard::GhostDropHead() {
+  assert(ghost_size_ > 0);
+  const size_t pos = ghost_head_seq_ & (ghost_ring_length_ - 1);
+  const GhostSlot& head = ghost_ring_[pos];
+  const size_t b = GhostFind(head.hash);
+  if (b != kNoGhost && ghost_index_[b] == pos + 1) {
+    GhostEraseBucket(b);
+  }
+  ghost_charge_ -= head.charge;
+  --ghost_size_;
+  ++ghost_head_seq_;
+}
+
+size_t FIFOCacheShard::GhostFind(uint32_t hash) const {
+  if (ghost_ring_length_ == 0) {
+    return kNoGhost;
+  }
+  const size_t mask = 2 * ghost_ring_length_ - 1;
+  // At most half the buckets are used, so the probe reaches an empty one.
+  for (size_t b = GhostHome(hash, ghost_index_bits_);; b = (b + 1) & mask) {
+    const uint32_t v = ghost_index_[b];
+    if (v == 0) {
+      return kNoGhost;
+    }
+    if (ghost_ring_[v - 1].hash == hash) {
+      return b;
+    }
+  }
+}
+
+void FIFOCacheShard::GhostEraseBucket(size_t b) {
+  const size_t mask = 2 * ghost_ring_length_ - 1;
+  size_t hole = b;
+  for (size_t j = (b + 1) & mask; ghost_index_[j] != 0; j = (j + 1) & mask) {
+    const uint32_t v = ghost_index_[j];
+    const size_t home = GhostHome(ghost_ring_[v - 1].hash, ghost_index_bits_);
+    // The bucket at j may fill the hole only if its probe passed the hole:
+    // its home is cyclically at or before the hole.
+    if (((j - home) & mask) >= ((j - hole) & mask)) {
+      ghost_index_[hole] = v;
+      hole = j;
+    }
+  }
+  ghost_index_[hole] = 0;
+}
+
 bool FIFOCacheShard::GhostTake(uint32_t hash) {
-  return ghost_index_.erase(hash) > 0;
+  const size_t b = GhostFind(hash);
+  if (b == kNoGhost) {
+    return false;
+  }
+  GhostEraseBucket(b);
+  return true;
+}
+
+size_t FIFOCacheShard::GhostLengthFor(size_t n) {
+  if (n == 0) {
+    return 0;
+  }
+  size_t length = kMinGhostLength;
+  while (length < n) {
+    length *= 2;
+  }
+  return length;
+}
+
+size_t FIFOCacheShard::GhostMetaChargeFor(size_t length) const {
+  return metadata_charge_policy_ == kFullChargeCacheMetadata
+             ? length * kGhostBytesPerSlot
+             : 0;
+}
+
+size_t FIFOCacheShard::GhostMetaCharge() const {
+  return GhostMetaChargeFor(ghost_ring_length_);
+}
+
+void FIFOCacheShard::GhostResize(size_t length) {
+  assert(length == 0 ||
+         (length >= kMinGhostLength && (length & (length - 1)) == 0));
+  // Callers trim the ghost to the entries first, and no length is below
+  // that, so every slot fits.
+  assert(ghost_size_ <= length);
+  ++ghost_records_;
+  std::unique_ptr<GhostSlot[]> ring;
+  std::unique_ptr<uint32_t[]> index;
+  int bits = 0;
+  if (length > 0) {
+    ring.reset(new GhostSlot[length]);
+    index.reset(new uint32_t[2 * length]());
+    bits = FloorLog2(2 * length);
+  }
+  if (ghost_size_ > 0) {
+    const size_t old_mask = ghost_ring_length_ - 1;
+    const size_t new_mask = 2 * length - 1;
+    for (uint64_t seq = ghost_head_seq_; seq < ghost_head_seq_ + ghost_size_;
+         ++seq) {
+      ring[seq & (length - 1)] = ghost_ring_[seq & old_mask];
+    }
+    // Every bucket names a slot between head and tail, so its position
+    // gives back its sequence number, and with it the new position.
+    const size_t head_pos = ghost_head_seq_ & old_mask;
+    for (size_t b = 0; b < 2 * ghost_ring_length_; ++b) {
+      const uint32_t v = ghost_index_[b];
+      if (v == 0) {
+        continue;
+      }
+      const uint64_t seq = ghost_head_seq_ + ((v - 1 - head_pos) & old_mask);
+      const size_t pos = seq & (length - 1);
+      size_t nb = GhostHome(ring[pos].hash, bits);
+      while (index[nb] != 0) {
+        nb = (nb + 1) & new_mask;
+      }
+      index[nb] = static_cast<uint32_t>(pos + 1);
+    }
+  }
+  usage_ -= GhostMetaCharge();
+  ghost_ring_ = std::move(ring);
+  ghost_index_ = std::move(index);
+  ghost_ring_length_ = length;
+  ghost_index_bits_ = bits;
+  usage_ += GhostMetaCharge();
+}
+
+void FIFOCacheShard::MaybeShrinkGhost() {
+  const size_t length = GhostLengthFor(occupancy_);
+  if (ghost_ring_length_ > 2 * length) {
+    GhostResize(length);
+  }
 }
 
 void FIFOCacheShard::NotifyEvicted(
@@ -1161,6 +1296,7 @@ void FIFOCacheShard::SetCapacity(size_t capacity) {
     // already tracks the new capacity when eviction below runs.
     EvictFromFIFO(0, 0, &last_reference_list);
     GhostTrim();
+    MaybeShrinkGhost();
     SyncOverCapacity();
   }
 
@@ -1232,10 +1368,9 @@ Status FIFOCacheShard::InsertItem(const Slice& key, HashCref hash,
     // Free the space following strict FIFO policy until enough space
     // is freed or no unpinned entry remains. A remembered key will land in
     // resident, so it does not count against the probation budget. A
-    // placeholder never uses the ghost (see ghost_index_).
-    GhostIndex::iterator ghost =
-        placeholder ? ghost_index_.end() : ghost_index_.find(GhostHash(hash));
-    const bool remembered = ghost != ghost_index_.end();
+    // placeholder never uses the ghost (see GhostSlot).
+    const size_t ghost = placeholder ? kNoGhost : GhostFind(GhostHash(hash));
+    const bool remembered = ghost != kNoGhost;
     const uint64_t ghost_records_before = ghost_records_;
     const size_t probation_charge = remembered ? 0 : total_charge;
     EvictFromFIFO(total_charge, probation_charge, &last_reference_list);
@@ -1295,6 +1430,24 @@ Status FIFOCacheShard::InsertItem(const Slice& key, HashCref hash,
         GrowOneHome();
         usage_ += GetTableMetaCharge() - meta_before;
       }
+      // The ghost may hold as many keys as there are entries, so a new
+      // entry beyond its ring doubles the ring. A charged growth must fit
+      // with the entry, after evicting for it as for a table step; if it
+      // does not, the ring stays as it is and drops its oldest key to
+      // record a new one.
+      if (old == nullptr && occupancy_ + 1 > ghost_ring_length_) {
+        const size_t length = GhostLengthFor(occupancy_ + 1);
+        const size_t growth = GhostMetaChargeFor(length) - GhostMetaCharge();
+        const size_t needed = SaturatingAdd(total_charge, growth);
+        if (growth > 0 && !FitsIn(usage_.Get(), needed, capacity_.Get())) {
+          EvictionData data;
+          data.need_charge = Excess(usage_.Get(), needed, capacity_.Get());
+          EvictNeed(&data, probation_charge, &last_reference_list);
+        }
+        if (growth == 0 || FitsIn(usage_.Get(), needed, capacity_.Get())) {
+          GhostResize(length);
+        }
+      }
       if (old == nullptr && used_length_ == max_length_ &&
           (occupancy_ + 1) * kGrowDenominator > max_length_ * kGrowNumerator) {
         // The table is as large as it gets: also evict one entry by
@@ -1333,12 +1486,12 @@ Status FIFOCacheShard::InsertItem(const Slice& key, HashCref hash,
         }
       }
       if (e != nullptr) {
-        // One ghost probe: the iterator from above is still valid unless
-        // eviction recorded a ghost since.
+        // One ghost probe: the bucket from above still names this key
+        // unless eviction recorded a ghost or the ghost was resized since.
         bool to_resident = false;
         if (remembered) {
           if (ghost_records_ == ghost_records_before) {
-            ghost_index_.erase(ghost);
+            GhostEraseBucket(ghost);
             to_resident = true;
           } else {
             to_resident = GhostTake(GhostHash(hash));
